@@ -246,10 +246,20 @@ Result<void> UnicornEngine::removeHook(uc_hook hook)
 	return {};
 }
 
-Result<RunOutcome> UnicornEngine::run(GuestVA begin, GuestVA until, uint64_t timeout_us)
+Result<RunOutcome> UnicornEngine::run(GuestVA begin, GuestVA until, uint64_t timeout_us, size_t count)
 {
+	// uc_emu_start installs its instruction-count hook lazily and does not
+	// flush the TB cache when it does (uc.c:1202). A TB translated by an
+	// earlier count = 0 run therefore keeps running to its end and ignores the
+	// budget. Drop the page before a counted run so the TB is re-translated
+	// with the count hook in place. (Observed as a libeleven single-step
+	// jumping from the entry to the end of the function.)
+	if (count != 0)
+	{
+		invalidateCode(begin, 4);
+	}
 	RunOutcome outcome;
-	outcome.err = uc_emu_start(engine_, begin.value(), until.value(), timeout_us, 0);
+	outcome.err = uc_emu_start(engine_, begin.value(), until.value(), timeout_us, count);
 	if (run_end_sink_)
 	{
 		try

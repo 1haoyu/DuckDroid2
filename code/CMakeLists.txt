@@ -25,6 +25,12 @@ option(DUCKEMU_USE_SYSTEM_UNICORN
 option(DUCKEMU_ENABLE_TRACE
        "Build the instruction-level trace (requires capstone >= 5)" OFF)
 
+# GDB remote debugging (M9) is an analysis-mode feature too. It has no extra
+# dependency, but it exposes arbitrary register/memory writes, so production
+# builds leave it out entirely: OFF compiles debug_stub.cpp instead.
+option(DUCKEMU_ENABLE_DEBUG
+       "Build the GDB remote debug server (RSP)" OFF)
+
 duckemu_setup_sanitizers()
 
 # ---------------------------------------------------------------------------
@@ -100,9 +106,20 @@ else()
     src/runtime/observer/trace/insn_trace_stub.cpp)
 endif()
 
+set(DUCKEMU_DEBUG_SOURCES)
+if(DUCKEMU_ENABLE_DEBUG)
+  list(APPEND DUCKEMU_DEBUG_SOURCES
+    src/runtime/debug/debug_server.cpp
+    src/runtime/debug/target_xml.cpp)
+else()
+  list(APPEND DUCKEMU_DEBUG_SOURCES
+    src/runtime/debug/debug_stub.cpp)
+endif()
+
 add_library(duckemu_runtime STATIC
   src/runtime/instance/runtime_instance.cpp
   src/runtime/clock/runtime_clock.cpp
+  ${DUCKEMU_DEBUG_SOURCES}
   src/runtime/jni/jni_types.cpp
   src/runtime/jni/abi/abi_adapter.cpp
   src/runtime/jni/env/jni_state.cpp
@@ -222,6 +239,11 @@ target_link_libraries(unicorn_spike PRIVATE
   Threads::Threads
 )
 duckemu_set_warnings(unicorn_spike)
+
+# M9 P1 spike: minimal GDB RSP stub that logs every client packet. No runtime,
+# no Unicorn; the fake target exists only to make a client connect and talk.
+add_executable(gdb_spike tools/spike/gdb_spike.cpp)
+duckemu_set_warnings(gdb_spike)
 
 # Reads svc.log produced by any RuntimeInstance (M2).
 add_executable(trace_viewer tools/trace_viewer/main.cpp)

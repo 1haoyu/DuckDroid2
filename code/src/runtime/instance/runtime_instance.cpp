@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "runtime/instance/runtime_instance.hpp"
 
+#include <functional>
 #include <utility>
 
 #include "common/log/logger.hpp"
 #include "runtime/backend/unicorn/unicorn_backend.hpp"
 #include "runtime/clock/runtime_clock.hpp"
+#include "runtime/debug/debug_server.hpp"
+#include "runtime/debug/debug_target.hpp"
 #include "runtime/jni/env/jni_state.hpp"
 #include "runtime/jni/envs/envs.hpp"
 #include "runtime/jni/world/java_world.hpp"
@@ -141,6 +144,87 @@ struct RuntimeInstance::Impl : loader::DlService
 	{
 		(void)handle;
 	}
+
+	// M9 debug face. The adapter is a nested type because Impl already has a
+	// data member named `modules`, which cannot coexist with Target::modules().
+	// Declared before the scheduler: destruction is reverse order, so the
+	// scheduler joins its host threads (which may call into the server) first.
+	struct DebugTargetAdapter final : debug::Target
+	{
+		explicit DebugTargetAdapter(Impl &owner)
+			: impl(owner)
+		{
+		}
+
+		Result<void> readMemory(uint64_t address, void *out, uint64_t size) override
+		{
+			return impl.memory.read(GuestVA{ address }, out, size);
+		}
+
+		Result<void> writeMemory(uint64_t address, const void *in, uint64_t size) override
+		{
+			return impl.memory.write(GuestVA{ address }, in, size);
+		}
+
+		std::vector<debug::ModuleInfo> modules() const override
+		{
+			std::vector<debug::ModuleInfo> out;
+			if (!impl.modules)
+			{
+				return out;
+			}
+			for (const auto &module : impl.modules->registry().modules())
+			{
+				debug::ModuleInfo info;
+				info.path = module->path;
+				info.soname = module->soname;
+				info.base = module->base;
+				info.span = module->span;
+				info.is_virtual = module->is_virtual;
+				out.push_back(std::move(info));
+			}
+			return out;
+		}
+
+		std::vector<debug::ThreadInfo> threads() override
+		{
+			if (!impl.scheduler)
+			{
+				return {};
+			}
+			return impl.scheduler->snapshotThreads();
+		}
+
+		Result<uint32_t> addStopHook(uint64_t address,
+			std::function<bool(uint32_t)> on_hit) override
+		{
+			auto hook = impl.backend->addAddressHook(GuestVA{ address },
+				[on_hit = std::move(on_hit)](observer::HookContext &context) {
+					if (on_hit(context.tid()))
+					{
+						context.requestStop();
+					}
+				});
+			if (hook.ok())
+			{
+				// A range hook only instruments TBs translated after it was
+				// added; invalidate the page so a breakpoint set on already
+				// executed code actually fires.
+				impl.backend->onCodeWritten(GuestVA{ address }, 4);
+			}
+			return hook;
+		}
+
+		void removeStopHook(uint32_t id) override
+		{
+			impl.backend->removeAddressHook(id);
+		}
+
+		Impl &impl;
+	};
+
+	std::unique_ptr<DebugTargetAdapter> debug_target;
+	std::unique_ptr<debug::DebugServer> debug;
 
 	// Declared last: the scheduler references every member above and must be
 	// destroyed first so its host threads are joined while the rest is alive.
@@ -1115,6 +1199,28 @@ void RuntimeInstance::stopInsnTrace()
 bool RuntimeInstance::insnTraceActive() const
 {
 	return impl_->backend->insnTraceActive();
+}
+
+Result<void> RuntimeInstance::startDebugServer(const debug::Options &options)
+{
+	if (impl_->debug)
+	{
+		return Error{ ErrorCode::AlreadyExists, "a debug server is already running" };
+	}
+	if (!impl_->scheduler)
+	{
+		return Error{ ErrorCode::InvalidArgument, "the instance is not initialized" };
+	}
+	impl_->debug_target = std::make_unique<Impl::DebugTargetAdapter>(*impl_);
+	auto server = debug::DebugServer::create(*impl_->debug_target, options);
+	if (!server.ok())
+	{
+		impl_->debug_target.reset();
+		return server.error();
+	}
+	impl_->debug = std::move(server).value();
+	impl_->scheduler->setDebugServer(impl_->debug.get());
+	return {};
 }
 
 } // namespace duckemu::runtime

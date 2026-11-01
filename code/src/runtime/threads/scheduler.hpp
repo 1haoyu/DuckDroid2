@@ -12,6 +12,7 @@
 
 #include "common/error/result.hpp"
 #include "runtime/backend/unicorn/unicorn_engine.hpp"
+#include "runtime/debug/debug_target.hpp"
 #include "runtime/observer/semantic/thread_event.hpp"
 #include "runtime/device/device_profile.hpp"
 #include "runtime/observer/trace/trace_clock.hpp"
@@ -30,6 +31,11 @@ class RuntimeClock;
 namespace observer
 {
 class EventBus;
+}
+
+namespace debug
+{
+class DebugServer;
 }
 
 namespace vfs
@@ -97,6 +103,10 @@ class ThreadScheduler final : public ThreadSystem
 	[[nodiscard]] uint64_t droppedDiagnostics() const;
 	[[nodiscard]] size_t liveThreadCount() const;
 
+	// Debug face (M9). Null unless RuntimeInstance::startDebugServer ran.
+	void setDebugServer(debug::DebugServer *server);
+	[[nodiscard]] std::vector<debug::ThreadInfo> snapshotThreads() const;
+
 	// ThreadSystem
 	int64_t cloneThread(RuntimeThread &parent, const CloneRequest &request) override;
 	int64_t futexWait(RuntimeThread &thread, GuestVA uaddr, uint32_t expected, uint64_t timeout_us) override;
@@ -151,6 +161,7 @@ class ThreadScheduler final : public ThreadSystem
 	observer::TraceClock clock_;
 	std::atomic<bool> stopping_{ false };
 	int32_t exit_code_ = 0;
+	debug::DebugServer *debug_ = nullptr;
 };
 
 } // namespace threads

@@ -23,6 +23,7 @@
 #include <string>
 
 #include "libeleven_case/libeleven_env.hpp"
+#include "runtime/debug/debug_target.hpp"
 #include "runtime/instance/runtime_instance.hpp"
 #include "runtime/observer/semantic/jni_event.hpp"
 
@@ -59,6 +60,8 @@ int main(int argc, char **argv)
 	std::string trace_path;
 	std::optional<uint64_t> wall_time_ns;
 	std::optional<uint64_t> monotonic_time_ns;
+	bool debug_enabled = false;
+	uint16_t debug_port = 31337;
 	int first = 1;
 	int last = 1;
 	int values = 0;
@@ -73,6 +76,21 @@ int main(int argc, char **argv)
 				return 2;
 			}
 			trace_path = argv[++index];
+			continue;
+		}
+		if (argument == "--debug")
+		{
+			debug_enabled = true;
+			continue;
+		}
+		if (argument == "--debug-port")
+		{
+			if (index + 1 >= argc)
+			{
+				std::fprintf(stderr, "--debug-port needs a value\n");
+				return 2;
+			}
+			debug_port = static_cast<uint16_t>(std::strtoul(argv[++index], nullptr, 10));
 			continue;
 		}
 		if (argument == "--wall-time-ns" || argument == "--monotonic-time-ns")
@@ -176,6 +194,21 @@ int main(int argc, char **argv)
 	{
 		std::fprintf(stderr, "load libeleven failed: %s\n", module.error().message.c_str());
 		return 1;
+	}
+
+	if (debug_enabled)
+	{
+		debug::Options options;
+		options.port = debug_port;
+		auto started = instance.startDebugServer(options);
+		if (!started.ok())
+		{
+			std::fprintf(stderr, "start debug server failed: %s\n",
+				started.error().message.c_str());
+			return 1;
+		}
+		std::fprintf(stderr, "debug: waiting for a GDB client on 127.0.0.1:%u\n",
+			static_cast<unsigned>(debug_port));
 	}
 
 	if (!trace_path.empty())

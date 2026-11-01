@@ -1595,6 +1595,198 @@ bool probe11() {
 }
 
 // ---------------------------------------------------------------------------
+// Probe 12 (M9): debugger stop semantics.
+//   A) uc_emu_stop from a code hook: does the hooked instruction execute?
+//   B) BRK #0: which error, which PC, does UC_HOOK_INTR fire?
+//   C) Instruction count: does count = 1 execute exactly one instruction?
+// ---------------------------------------------------------------------------
+struct StopCtx {
+    int code_hits = 0;
+    int intr_hits = 0;
+    uint32_t last_intr = 0;
+    uint64_t stop_address = 0;
+};
+
+void on_stop_code(uc_engine* uc, uint64_t address, uint32_t /*size*/, void* user_data) {
+    auto* ctx = static_cast<StopCtx*>(user_data);
+    ++ctx->code_hits;
+    if (ctx->stop_address != 0 && address == ctx->stop_address) {
+        uc_emu_stop(uc);
+    }
+}
+
+void on_stop_intr(uc_engine* uc, uint32_t intno, void* user_data) {
+    (void)uc;
+    auto* ctx = static_cast<StopCtx*>(user_data);
+    ++ctx->intr_hits;
+    ctx->last_intr = intno;
+}
+
+void write_program(uc_engine* uc, const Assembler& a) {
+    uc_mem_write(uc, kCode, a.words().data(), a.words().size() * sizeof(uint32_t));
+}
+
+bool probe12_stop_from_code_hook() {
+    std::printf("\n== Probe 12A: uc_emu_stop from a code hook ==\n");
+    uc_engine* uc = open_engine("p12a");
+    if (uc == nullptr || !map_basic(uc)) {
+        return false;
+    }
+    Assembler a(kCode);
+    a.mov(0, 0x10);
+    const uint64_t bp = a.pc();
+    a.mov(1, 0x11); // hooked instruction
+    a.mov(2, 0x12);
+    write_program(uc, a);
+
+    StopCtx ctx;
+    ctx.stop_address = bp;
+    uc_hook hook = 0;
+    uc_hook_add(uc, &hook, UC_HOOK_CODE, reinterpret_cast<void*>(&on_stop_code), &ctx, bp, bp);
+    const uc_err err = uc_emu_start(uc, kCode, 0, 0, 0);
+    const uint64_t pc = read_reg(uc, UC_ARM64_REG_PC);
+    const uint64_t x1 = read_reg(uc, UC_ARM64_REG_X1);
+    show_err("run error", err);
+    show_u64("bp address", bp);
+    show_u64("PC after stop", pc);
+    show_u64("x1 after stop (0x11 => instruction executed)", x1);
+    std::printf("  %-46s %s\n", "PC == bp (stopped before execution)",
+                pc == bp ? "YES" : "NO");
+    std::printf("  %-46s %s\n", "PC == bp + 4 (stopped after execution)",
+                pc == bp + 4 ? "YES" : "NO");
+    uc_close(uc);
+    return true;
+}
+
+bool probe12_brk() {
+    std::printf("\n== Probe 12B: BRK #0 semantics ==\n");
+    uc_engine* uc = open_engine("p12b");
+    if (uc == nullptr || !map_basic(uc)) {
+        return false;
+    }
+    Assembler a(kCode);
+    a.mov(0, 0x10);
+    const uint64_t brk_pc = a.pc();
+    a.emit(0xD4200000u); // brk #0
+    a.mov(2, 0x12);
+    write_program(uc, a);
+
+    StopCtx ctx;
+    uc_hook intr = 0;
+    uc_hook_add(uc, &intr, UC_HOOK_INTR, reinterpret_cast<void*>(&on_stop_intr), &ctx, 1, 0);
+    // Bound the run with an instruction count: if Unicorn does not consume the
+    // BRK exception it can retry the same PC forever.
+    const uc_err err = uc_emu_start(uc, kCode, 0, 0, 1000);
+    const uint64_t pc = read_reg(uc, UC_ARM64_REG_PC);
+    const uint64_t x2 = read_reg(uc, UC_ARM64_REG_X2);
+    show_err("run error", err);
+    show_u64("BRK address", brk_pc);
+    show_u64("PC after BRK", pc);
+    show_u64("x2 (0x12 => BRK skipped the rest)", x2);
+    std::printf("  %-46s %d (last intno %u)\n", "UC_HOOK_INTR hits", ctx.intr_hits,
+                ctx.last_intr);
+    std::printf("  %-46s %s\n", "PC stuck on BRK",
+                pc == brk_pc ? "YES" : "NO");
+    uc_close(uc);
+    return true;
+}
+
+bool probe12_count() {
+    std::printf("\n== Probe 12C: uc_emu_start count = 1 ==\n");
+    uc_engine* uc = open_engine("p12c");
+    if (uc == nullptr || !map_basic(uc)) {
+        return false;
+    }
+    Assembler a(kCode);
+    a.mov(0, 0x10);
+    a.mov(1, 0x11);
+    a.mov(2, 0x12);
+    write_program(uc, a);
+
+    uc_err err = uc_emu_start(uc, kCode, 0, 0, 1);
+    show_err("first count=1", err);
+    expect_u64("after 1 instruction: pc", read_reg(uc, UC_ARM64_REG_PC), kCode + 4);
+    expect_u64("after 1 instruction: x0", read_reg(uc, UC_ARM64_REG_X0), 0x10);
+    expect_u64("after 1 instruction: x1", read_reg(uc, UC_ARM64_REG_X1), 0);
+
+    err = uc_emu_start(uc, read_reg(uc, UC_ARM64_REG_PC), 0, 0, 1);
+    show_err("second count=1", err);
+    expect_u64("after 2 instructions: pc", read_reg(uc, UC_ARM64_REG_PC), kCode + 8);
+    expect_u64("after 2 instructions: x1", read_reg(uc, UC_ARM64_REG_X1), 0x11);
+    uc_close(uc);
+    return true;
+}
+
+// Does an installed code hook change what count = 1 means? The debugger
+// always has a hook exactly at the instruction it is stepping over.
+bool probe12_count_with_hook() {
+    std::printf("\n== Probe 12D: count = 1 with a code hook at the same address ==\n");
+    uc_engine* uc = open_engine("p12d");
+    if (uc == nullptr || !map_basic(uc)) {
+        return false;
+    }
+    Assembler a(kCode);
+    a.mov(0, 0x10);
+    const uint64_t hooked = a.pc();
+    a.mov(1, 0x11);
+    a.mov(2, 0x12);
+    write_program(uc, a);
+
+    StopCtx ctx; // stop_address == 0: the hook never stops
+    uc_hook hook = 0;
+    uc_hook_add(uc, &hook, UC_HOOK_CODE, reinterpret_cast<void*>(&on_stop_code), &ctx,
+                hooked, hooked);
+    uc_err err = uc_emu_start(uc, kCode, 0, 0, 2); // two instructions: mov, mov
+    show_err("run count=2 with hook", err);
+    show_u64("pc after count=2", read_reg(uc, UC_ARM64_REG_PC));
+    show_u64("x0", read_reg(uc, UC_ARM64_REG_X0));
+    show_u64("x1", read_reg(uc, UC_ARM64_REG_X1));
+    show_u64("x2", read_reg(uc, UC_ARM64_REG_X2));
+    std::printf("  %-46s %s\n", "hook fired", ctx.code_hits ? "YES" : "NO");
+    uc_close(uc);
+    return true;
+}
+
+// Decisive case for the real debugger: hook exactly at the instruction we
+// start from, then count = 1.
+bool probe12_count_hook_at_start() {
+    std::printf("\n== Probe 12E: count = 1, hook at the first instruction ==\n");
+    uc_engine* uc = open_engine("p12e");
+    if (uc == nullptr || !map_basic(uc)) {
+        return false;
+    }
+    Assembler a(kCode);
+    a.mov(0, 0x10);
+    a.mov(1, 0x11);
+    a.mov(2, 0x12);
+    write_program(uc, a);
+
+    StopCtx ctx;
+    uc_hook hook = 0;
+    uc_hook_add(uc, &hook, UC_HOOK_CODE, reinterpret_cast<void*>(&on_stop_code), &ctx,
+                kCode, kCode);
+    const uc_err err = uc_emu_start(uc, kCode, 0, 0, 1);
+    show_err("run count=1", err);
+    show_u64("pc", read_reg(uc, UC_ARM64_REG_PC));
+    show_u64("x0", read_reg(uc, UC_ARM64_REG_X0));
+    show_u64("x1", read_reg(uc, UC_ARM64_REG_X1));
+    show_u64("x2", read_reg(uc, UC_ARM64_REG_X2));
+    std::printf("  %-46s %s\n", "exactly one instruction",
+                read_reg(uc, UC_ARM64_REG_PC) == kCode + 4 ? "YES" : "NO");
+    uc_close(uc);
+    return true;
+}
+
+bool probe12() {
+    probe12_stop_from_code_hook();
+    probe12_brk();
+    probe12_count();
+    probe12_count_with_hook();
+    probe12_count_hook_at_start();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 struct Probe {
@@ -1615,6 +1807,7 @@ const Probe kProbes[] = {
     {9, "cross-thread stop + paused engine", &probe9},
     {10, "code hook writes PC (redirect)", &probe10},
     {11, "code/mem/intr order + SVC replay", &probe11},
+    {12, "debugger stop / BRK / count=1", &probe12},
 };
 
 } // namespace

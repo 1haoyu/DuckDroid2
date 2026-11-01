@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 
@@ -70,8 +71,9 @@ class UnicornEngine
 
 	// Runs guest code until `until`, a stop request, a timeout or a fault.
 	// `until == 0` means "no end address"; the thread only leaves through an
-	// SVC handler, a fault or a stop request.
-	Result<RunOutcome> run(GuestVA begin, GuestVA until, uint64_t timeout_us);
+	// SVC handler, a fault or a stop request. `count == 0` means "no
+	// instruction budget"; a count of 1 is the debugger's single-step.
+	Result<RunOutcome> run(GuestVA begin, GuestVA until, uint64_t timeout_us, size_t count = 0);
 	void stop();
 
 	Result<uint64_t> readRegister(int reg) const;

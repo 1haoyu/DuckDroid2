@@ -203,4 +203,9 @@ Result<void> HookContext::setPc(uint64_t address)
 	return {};
 }
 
+void HookContext::requestStop()
+{
+	uc_emu_stop(engineOf(engine_));
+}
+
 } // namespace duckemu::runtime::observer

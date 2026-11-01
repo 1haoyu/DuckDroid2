@@ -9,6 +9,7 @@
 
 #include "common/log/logger.hpp"
 #include "runtime/backend/unicorn/unicorn_backend.hpp"
+#include "runtime/debug/debug_server.hpp"
 #include "runtime/memory/address_space.hpp"
 #include "runtime/observer/event_bus.hpp"
 #include "runtime/svc/dispatcher.hpp"
@@ -257,6 +258,13 @@ Result<CallResult> ThreadScheduler::callFunction(GuestVA entry, const std::array
 		return Error{ ErrorCode::InvalidArgument, "the main thread has exited" };
 	}
 
+	// Model A: stop at the entry so a client can attach before the target
+	// runs. The guest thread is idle here, so the hook is installed safely.
+	if (debug_ != nullptr)
+	{
+		debug_->armEntry(entry.value());
+	}
+
 	main_->call_active = true;
 	main_->call_done = false;
 	main_->call_error.reset();
@@ -450,8 +458,35 @@ void ThreadScheduler::hostThreadLoop(RuntimeThread &thread)
 		// "stopped outside the return trap" at svc+4). Threads leave through an
 		// SVC stop or a fault; a spinning guest hangs the caller until the host
 		// watchdog lands (M3 design §12).
-		auto outcome = thread.engine->run(thread.next_pc, GuestVA{ until }, 0);
-		handleRunOutcome(thread, outcome);
+		for (;;)
+		{
+			const size_t count = debug_ != nullptr ? debug_->nextRunCount() : 0;
+			auto outcome = thread.engine->run(thread.next_pc, GuestVA{ until }, 0, count);
+
+			bool debug_stop = false;
+			if (debug_ != nullptr && outcome.ok())
+			{
+				std::lock_guard<std::mutex> lock(thread.mutex);
+				debug_stop = thread.state == ThreadState::Executing && debug_->consumeStop(thread.tid);
+			}
+			if (!debug_stop)
+			{
+				handleRunOutcome(thread, outcome);
+				break;
+			}
+
+			// Park with the execution lock still held: all-stop, and the RSP
+			// loop runs on this (the owning) host thread.
+			{
+				std::lock_guard<std::mutex> lock(thread.mutex);
+				thread.next_pc = GuestVA{ outcome.value().pc };
+			}
+			if (auto tp = thread.engine->readRegister(UC_ARM64_REG_TPIDR_EL0); tp.ok())
+			{
+				thread.tls_tp = tp.value();
+			}
+			debug_->serve(thread);
+		}
 		execution.unlock();
 	}
 
@@ -1006,6 +1041,27 @@ size_t ThreadScheduler::liveThreadCount() const
 {
 	std::lock_guard<std::mutex> lock(instance_mutex_);
 	return threads_.size();
+}
+
+void ThreadScheduler::setDebugServer(debug::DebugServer *server)
+{
+	debug_ = server;
+}
+
+std::vector<debug::ThreadInfo> ThreadScheduler::snapshotThreads() const
+{
+	std::lock_guard<std::mutex> lock(instance_mutex_);
+	std::vector<debug::ThreadInfo> out;
+	out.reserve(threads_.size());
+	for (const auto &entry : threads_)
+	{
+		debug::ThreadInfo info;
+		info.tid = entry.first;
+		info.state = threadStateName(entry.second->state);
+		info.pc = entry.second->next_pc.value();
+		out.push_back(std::move(info));
+	}
+	return out;
 }
 
 } // namespace duckemu::runtime::threads

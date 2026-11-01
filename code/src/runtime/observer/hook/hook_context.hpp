@@ -73,6 +73,11 @@ class HookContext
 	// Writes PC. Returns an error if Unicorn rejects the register write.
 	[[nodiscard]] Result<void> setPc(uint64_t address);
 
+	// Stops the current uc_emu_start. Probe 12A: the instruction at `address`
+	// does not execute, so this is a genuine pre-instruction breakpoint. The
+	// scheduler parks the thread and hands control to the debugger.
+	void requestStop();
+
     private:
 	friend class ::duckemu::runtime::UnicornBackend;
 

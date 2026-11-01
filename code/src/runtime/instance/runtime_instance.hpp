@@ -27,6 +27,12 @@ namespace jni
 class JavaWorld;
 }
 
+namespace debug
+{
+struct Options;
+class DebugServer;
+}
+
 // A project's Java environment pack (one function that declares its classes,
 // methods, fields and shims). Target packs live in code/user_code and are
 // installed explicitly by their runner; the runtime never names a target.
@@ -209,6 +215,12 @@ class RuntimeInstance
 	Result<void> startInsnTrace(observer::InsnTraceOptions options);
 	void stopInsnTrace();
 	[[nodiscard]] bool insnTraceActive() const;
+
+	// M9 debug face (model A). Requires -DDUCKEMU_ENABLE_DEBUG=ON; a build
+	// without it returns Unsupported. The server only listens on 127.0.0.1
+	// and only exists while this instance does. The first callFunction arms an
+	// entry stop so a client can attach before the target runs.
+	Result<void> startDebugServer(const debug::Options &options);
 
     private:
 	struct Impl;
