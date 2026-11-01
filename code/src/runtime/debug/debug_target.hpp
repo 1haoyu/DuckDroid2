@@ -30,6 +30,9 @@ struct ThreadInfo
 struct Options
 {
 	uint16_t port = 31337;
+	// Packet log. Empty means /tmp/<executable-basename>-gdb.log, so each
+	// target runner gets its own file without extra wiring.
+	std::string log_path;
 };
 
 // Narrow view of one RuntimeInstance for the RSP server. Implemented by

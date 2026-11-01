@@ -23,16 +23,18 @@ namespace duckemu::runtime::debug
 namespace
 {
 
-void trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
-void trace(const char *format, ...)
+std::string defaultLogPath()
 {
-	char buffer[1024];
-	va_list args;
-	va_start(args, format);
-	std::vsnprintf(buffer, sizeof(buffer), format, args);
-	va_end(args);
-	std::fprintf(stderr, "[gdb] %s\n", buffer);
-	std::fflush(stderr);
+	char exe[4096] = {};
+	const ssize_t length = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	std::string base = "duckemu";
+	if (length > 0)
+	{
+		const std::string path(exe, static_cast<size_t>(length));
+		const size_t slash = path.find_last_of('/');
+		base = slash == std::string::npos ? path : path.substr(slash + 1);
+	}
+	return "/tmp/" + base + "-gdb.log";
 }
 
 int hexValue(char c)
@@ -148,6 +150,23 @@ DebugServer::DebugServer(Target &target, const Options &options)
 DebugServer::~DebugServer()
 {
 	close();
+	if (log_file_ != nullptr)
+	{
+		std::fclose(log_file_);
+		log_file_ = nullptr;
+	}
+}
+
+void DebugServer::log(const char *format, ...)
+{
+	char buffer[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	std::FILE *out = log_file_ != nullptr ? log_file_ : stderr;
+	std::fprintf(out, "[gdb] %s\n", buffer);
+	std::fflush(out);
 }
 
 Result<std::unique_ptr<DebugServer> > DebugServer::create(Target &target, const Options &options)
@@ -181,7 +200,17 @@ bool DebugServer::listen()
 		listener_ = -1;
 		return false;
 	}
-	trace("listening on 127.0.0.1:%u", static_cast<unsigned>(options_.port));
+	log_path_ = options_.log_path.empty() ? defaultLogPath() : options_.log_path;
+	log_file_ = std::fopen(log_path_.c_str(), "w");
+	if (log_file_ == nullptr)
+	{
+		std::fprintf(stderr, "[gdb] cannot open %s; packet log falls back to stderr\n",
+			log_path_.c_str());
+	}
+	log("listening on 127.0.0.1:%u", static_cast<unsigned>(options_.port));
+	std::fprintf(stderr, "[gdb] listening on 127.0.0.1:%u (packet log: %s)\n",
+		static_cast<unsigned>(options_.port), log_path_.c_str());
+	std::fflush(stderr);
 	return true;
 }
 
@@ -200,7 +229,7 @@ bool DebugServer::acceptClient()
 	ack_ = true;
 	no_ack_ = false;
 	detach_requested_ = false;
-	trace("client connected");
+	log("client connected");
 	return true;
 }
 
@@ -296,7 +325,7 @@ void DebugServer::logPacket(const char *direction, const std::string &payload)
 	{
 		shown = shown.substr(0, 160) + "...";
 	}
-	trace("%s %s", direction, shown.c_str());
+	log("%s %s", direction, shown.c_str());
 }
 
 bool DebugServer::receivePacket(std::string &payload)
@@ -487,7 +516,7 @@ void DebugServer::installBreakpoint(uint64_t address)
 	if (hook.ok())
 	{
 		breakpoints_[address] = hook.value();
-		trace("breakpoint 0x%" PRIx64 " armed", address);
+		log("breakpoint 0x%" PRIx64 " armed", address);
 	}
 }
 
@@ -500,7 +529,7 @@ void DebugServer::removeBreakpoint(uint64_t address)
 	}
 	target_.removeStopHook(at->second);
 	breakpoints_.erase(at);
-	trace("breakpoint 0x%" PRIx64 " removed", address);
+	log("breakpoint 0x%" PRIx64 " removed", address);
 }
 
 void DebugServer::armEntry(uint64_t entry)
@@ -521,7 +550,7 @@ void DebugServer::armEntry(uint64_t entry)
 	{
 		entry_hook_ = hook.value();
 		entry_address_ = entry;
-		trace("entry stop 0x%" PRIx64 " armed", entry);
+		log("entry stop 0x%" PRIx64 " armed", entry);
 	}
 }
 

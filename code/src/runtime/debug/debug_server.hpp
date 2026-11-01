@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <string>
@@ -91,6 +92,7 @@ class DebugServer
 	static std::string escapePayload(const std::string &payload);
 	static std::string unescapePayload(const std::string &raw);
 	void logPacket(const char *direction, const std::string &payload);
+	void log(const char *format, ...) __attribute__((format(printf, 2, 3)));
 
 	// Packet dispatch. `stopped` is true when this serve() is already at a
 	// stop (the client is waiting for a stop reply after c/s).
@@ -113,6 +115,11 @@ class DebugServer
 	Target &target_;
 	Options options_;
 	threads::RuntimeThread *current_ = nullptr;
+
+	// Packet traffic goes here, not to the console: a debugging session is
+	// thousands of packets and would drown the runner's own output.
+	std::string log_path_;
+	std::FILE *log_file_ = nullptr;
 
 	int listener_ = -1;
 	int client_ = -1;
