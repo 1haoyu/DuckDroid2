@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -187,6 +188,18 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	if (!trace_path.empty())
+	{
+		std::error_code directory_error;
+		std::filesystem::create_directories(trace_path, directory_error);
+		if (directory_error)
+		{
+			std::fprintf(stderr, "cannot create trace directory %s: %s\n",
+				trace_path.c_str(), directory_error.message().c_str());
+			return 1;
+		}
+	}
+
 	std::vector<uint8_t> blob;
 	std::string error;
 	if (!readFile(blob_path, &blob, &error))
@@ -204,7 +217,7 @@ int main(int argc, char **argv)
 
 	RuntimeConfig config;
 	config.library_search_paths = { DUCKEMU_ROM_BOOTSTRAP, DUCKEMU_ROM_LIB64 };
-	config.trace_path = trace_path;
+	config.trace_path = trace_path.empty() ? std::string{} : trace_path + "/svc.log";
 	config.filesystem_roots = roots;
 	config.property_file = DUCKEMU_SZSTONE_PROPERTIES;
 	config.default_timeout_us = kCallTimeoutUs;
@@ -267,10 +280,36 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (!trace_path.empty())
+	{
+		// Trace only the lf call, not the UPX unpack and loader work above.
+		// The range is the loaded target module, computed from its handle.
+		auto range = instance.moduleRange(module.value());
+		if (!range.ok())
+		{
+			std::fprintf(stderr, "module range for trace failed: %s\n",
+				range.error().message.c_str());
+			return 1;
+		}
+		observer::InsnTraceOptions options;
+		options.directory = trace_path + "/insn";
+		options.begin = range.value().base;
+		options.size = range.value().span;
+		options.stop_at_return = true;
+		auto started = instance.startInsnTrace(options);
+		if (!started.ok())
+		{
+			std::fprintf(stderr, "start instruction trace failed: %s\n",
+				started.error().message.c_str());
+			return 1;
+		}
+	}
+
 	const std::string_view blob_view = blob.empty()
 		? std::string_view{}
 		: std::string_view(reinterpret_cast<const char *>(blob.data()), blob.size());
 	auto output = szstone::invokeLf(instance, blob_view, z);
+	instance.stopInsnTrace();
 	if (!output.ok())
 	{
 		std::fprintf(stderr, "SzSdk.lf failed: %s\n", output.error().message.c_str());
