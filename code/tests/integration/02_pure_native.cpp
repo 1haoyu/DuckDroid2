@@ -102,7 +102,7 @@ void checkSvcTrace(const std::vector<observer::SvcEvent>& records, const NativeO
         CHECK_EQ(records[i].seq, i);
         CHECK(records[i].name == expected_names[i]);
         CHECK_EQ(records[i].tid, kTid);
-        CHECK(records[i].supported);
+        CHECK(records[i].support == observer::SvcSupport::Supported);
         CHECK(records[i].stack.empty());
         CHECK_EQ(records[i].svc_address % 4, 0);
     }

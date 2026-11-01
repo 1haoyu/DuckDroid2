@@ -10,6 +10,7 @@
 #include "runtime/random/random_source.hpp"
 #include "runtime/svc/handler.hpp"
 #include "runtime/svc/syscall_numbers.hpp"
+#include "runtime/threads/thread_system.hpp"
 
 namespace duckemu::runtime::svc
 {
@@ -74,6 +75,10 @@ int64_t sysPrctl(SyscallContext &ctx)
 		auto written = ctx.memory.write(GuestVA{ ctx.args[1] }, name, sizeof(name));
 		return written.ok() ? 0 : -kEfault;
 	}
+	// Every other option is accepted and forgotten (PR_SET_NAME, DUMPABLE,
+	// NO_NEW_PRIVS, ...). Returning 0 is what the targets expect, but the
+	// effect did not happen, so the trace marks the call degraded.
+	ctx.degrade("prctl option is accepted but not modelled");
 	return 0;
 }
 
@@ -103,13 +108,22 @@ int64_t sysSchedGetaffinity(SyscallContext &ctx)
 
 int64_t sysSigaltstack(SyscallContext &ctx)
 {
+	// No signal delivery, so there is no alternate stack to report.
+	ctx.degrade("signals are not delivered");
 	const uint64_t old_stack = ctx.args[1];
 	const uint64_t empty[3] = { 0, 0, 0 };
 	return writeArray(ctx, old_stack, empty, 3);
 }
 
+int64_t sysRtSigaction(SyscallContext &ctx)
+{
+	ctx.degrade("signals are not delivered");
+	return 0;
+}
+
 int64_t sysRtSigprocmask(SyscallContext &ctx)
 {
+	ctx.degrade("signals are not delivered");
 	const uint64_t old_set = ctx.args[2];
 	const uint64_t empty = 0;
 	return writeArray(ctx, old_set, &empty, 1);
@@ -322,8 +336,10 @@ int64_t sysClockNanosleep(SyscallContext &ctx)
 // raised signal cannot reach a handler. DuckDroid answers these with 0;
 // metasec probes tgkill(getpid(), gettid(), SIGRTMAX) and takes a fallback
 // path when the call fails.
-int64_t sysRaiseSignal(SyscallContext &)
+int64_t sysRaiseSignal(SyscallContext &ctx)
 {
+	// Accepted so probes take their normal path, but nothing is delivered.
+	ctx.degrade("signals are not delivered");
 	return 0;
 }
 
@@ -389,11 +405,15 @@ std::optional<int64_t> handleMiscSyscall(SyscallContext &ctx, uint32_t number)
 	case kSysSchedGetaffinity:
 		return sysSchedGetaffinity(ctx);
 	case kSysSchedYield:
+		// The guest asked to give up the CPU. The scheduler drops the
+		// execution lock after this SVC and lets another runnable thread in;
+		// returning 0 without yielding used to make yield loops spin forever.
+		ctx.threads.yieldThread(ctx.thread);
 		return 0;
 	case kSysSigaltstack:
 		return sysSigaltstack(ctx);
 	case kSysRtSigaction:
-		return 0;
+		return sysRtSigaction(ctx);
 	case kSysRtSigprocmask:
 		return sysRtSigprocmask(ctx);
 	case kSysGetrlimit:
@@ -401,7 +421,14 @@ std::optional<int64_t> handleMiscSyscall(SyscallContext &ctx, uint32_t number)
 	case kSysPrlimit64:
 		return sysPrlimit64(ctx);
 	case kSysSetRobustList:
+		// Robust futexes need the kernel's per-thread robust list and the
+		// exit-time wakeups; a single-CPU runtime accepts the registration but
+		// does not maintain it.
+		ctx.degrade("robust futex list is not modelled");
+		return 0;
 	case kSysMembarrier:
+		// Guest threads are serialized, so a memory barrier request is already
+		// satisfied by the execution lock.
 		return 0;
 	case kSysGetrandom:
 		return sysGetrandom(ctx);

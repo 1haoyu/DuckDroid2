@@ -11,6 +11,7 @@ using duckemu::runtime::observer::GuestFrame;
 using duckemu::runtime::observer::parseSvcTraceLine;
 using duckemu::runtime::observer::SvcEvent;
 using duckemu::runtime::observer::SvcKind;
+using duckemu::runtime::observer::SvcSupport;
 
 namespace {
 
@@ -51,7 +52,7 @@ void testSupportedRoundTrip() {
     CHECK(parsed->kind == original.kind);
     CHECK(parsed->name == original.name);
     CHECK_EQ(parsed->result, original.result);
-    CHECK(parsed->supported);
+    CHECK(parsed->support == SvcSupport::Supported);
     CHECK(parsed->stack.empty());
     CHECK(parsed->stack_stop.empty());
     for (size_t i = 0; i < original.args.size(); ++i) {
@@ -63,7 +64,7 @@ void testUnsupportedRoundTrip() {
     SvcEvent original = makeSyscallEvent();
     original.kind = SvcKind::HostStub;
     original.name = "host_add";
-    original.supported = false;
+    original.support = SvcSupport::Unsupported;
     original.result = static_cast<uint64_t>(static_cast<int64_t>(-38));
     original.stack.push_back(GuestFrame{ 0x4010020c, "code-native!0x20c" });
     original.stack.push_back(GuestFrame{ 0x40100310, "return-trap!0x0" });
@@ -82,7 +83,7 @@ void testUnsupportedRoundTrip() {
     if (!parsed.has_value()) {
         return;
     }
-    CHECK(!parsed->supported);
+    CHECK(parsed->support == SvcSupport::Unsupported);
     CHECK(parsed->kind == SvcKind::HostStub);
     CHECK(parsed->name == "host_add");
     CHECK_EQ(parsed->result, original.result);
@@ -96,14 +97,48 @@ void testUnsupportedRoundTrip() {
     }
 }
 
+void testDegradedRoundTrip() {
+    SvcEvent original = makeSyscallEvent();
+    original.name = "clone";
+    original.support = SvcSupport::Degraded;
+    original.degraded_reason = "clone without CLONE_VM|CLONE_THREAD";
+    original.result = static_cast<uint64_t>(static_cast<int64_t>(-22));
+
+    const std::string line = formatSvcTraceLine(original);
+    const std::string expected_note =
+        "{\"degraded\":1,\"reason\":\"clone without CLONE_VM|CLONE_THREAD\"}";
+    CHECK(line.size() > expected_note.size());
+    CHECK(line.compare(line.size() - expected_note.size(), expected_note.size(), expected_note) == 0);
+
+    const auto parsed = parseSvcTraceLine(line);
+    CHECK(parsed.has_value());
+    if (!parsed.has_value()) {
+        return;
+    }
+    CHECK(parsed->support == SvcSupport::Degraded);
+    CHECK(parsed->degraded_reason == original.degraded_reason);
+    CHECK(parsed->stack.empty());
+    CHECK(parsed->stack_stop.empty());
+
+    // A degraded call without a reason keeps the note minimal.
+    SvcEvent bare = original;
+    bare.degraded_reason.clear();
+    const auto bare_parsed = parseSvcTraceLine(formatSvcTraceLine(bare));
+    CHECK(bare_parsed.has_value());
+    if (bare_parsed.has_value()) {
+        CHECK(bare_parsed->support == SvcSupport::Degraded);
+        CHECK(bare_parsed->degraded_reason.empty());
+    }
+}
+
 void testEmptyStackUnsupported() {
     SvcEvent original = makeSyscallEvent();
-    original.supported = false;
+    original.support = SvcSupport::Unsupported;
     original.stack_stop = "cannot read sp/fp";
     const auto parsed = parseSvcTraceLine(formatSvcTraceLine(original));
     CHECK(parsed.has_value());
     if (parsed.has_value()) {
-        CHECK(!parsed->supported);
+        CHECK(parsed->support == SvcSupport::Unsupported);
         CHECK(parsed->stack.empty());
         CHECK(parsed->stack_stop == "cannot read sp/fp");
     }
@@ -141,6 +176,7 @@ int main() {
     testGoldenLine();
     testSupportedRoundTrip();
     testUnsupportedRoundTrip();
+    testDegradedRoundTrip();
     testEmptyStackUnsupported();
     testTabInNameIsSanitized();
     testMalformedLines();

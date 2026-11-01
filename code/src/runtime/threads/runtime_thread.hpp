@@ -110,8 +110,20 @@ struct RuntimeThread
 	bool has_deadline = false;
 	bool deadline_expired = false;
 	std::chrono::steady_clock::time_point deadline;
+	// The relative timeout that armed the deadline. On expiry an injected
+	// clock moves forward by exactly this much, so the guest observes the
+	// timeout it asked for instead of a frozen clock.
+	uint64_t pending_timeout_us = 0;
 	// Non-zero while this thread sits in the futex wait queue.
 	uint64_t futex_key = 0;
+
+	// Set by sched_yield(2) inside the SVC hook; the host loop consumes it
+	// after releasing the execution lock.
+	bool yield_requested = false;
+	// >0 while a host stub runs a nested guest call on this thread. A yield
+	// cannot leave the engine there: the nested uc_emu_start is owned by the
+	// host stub, not by the scheduler loop.
+	int nested_call_depth = 0;
 
 	bool exit_requested = false;
 	int32_t exit_code = 0;

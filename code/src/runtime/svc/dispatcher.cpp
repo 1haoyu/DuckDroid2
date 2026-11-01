@@ -252,7 +252,7 @@ void SvcDispatcher::onTrap(uc_engine *uc, uint32_t intno)
 		event.number = static_cast<uint32_t>(number.value());
 		const std::string_view name = syscallName(event.number);
 		event.name = name.empty() ? "sys#" + std::to_string(event.number) : std::string(name);
-		result = dispatchSyscall(event.number, event.args, event.supported);
+		result = dispatchSyscall(event.number, event.args, event);
 	}
 	else if ((imm & kHostStubBase) != 0)
 	{
@@ -272,14 +272,14 @@ void SvcDispatcher::onTrap(uc_engine *uc, uint32_t intno)
 		{
 			event.args[i] = raw_args[i];
 		}
-		result = invokeHostStub(uc, event.number, raw_args, event.supported);
+		result = invokeHostStub(uc, event.number, raw_args, event);
 	}
 	else
 	{
 		event.kind = observer::SvcKind::UnknownTrap;
 		event.number = imm;
 		event.name = "trap#" + hexString(imm);
-		event.supported = false;
+		event.support = observer::SvcSupport::Unsupported;
 		result = kError(kEnosys);
 		stop_after_publish = true;
 	}
@@ -301,7 +301,7 @@ void SvcDispatcher::onTrap(uc_engine *uc, uint32_t intno)
 		return;
 	}
 
-	if (!event.supported)
+	if (event.support == observer::SvcSupport::Unsupported)
 	{
 		captureStack(uc, event);
 		logUnsupported(event);
@@ -310,13 +310,18 @@ void SvcDispatcher::onTrap(uc_engine *uc, uint32_t intno)
 	event.id = clock_.next_id++;
 	events_.publishSvc(event);
 
-	if (thread_.exit_requested || threads_.stopping() || stop_after_publish)
+	// A yield leaves the thread Runnable (not Executing) so the owning host
+	// loop releases the execution lock and another guest thread can run.
+	if (thread_.exit_requested || threads_.stopping() || stop_after_publish ||
+	    thread_.state != threads::ThreadState::Executing)
 	{
 		uc_emu_stop(uc);
 	}
 }
 
-int64_t SvcDispatcher::dispatchSyscall(uint32_t number, const std::array<uint64_t, 6> &args, bool &supported)
+int64_t SvcDispatcher::dispatchSyscall(uint32_t number,
+	const std::array<uint64_t, 6> &args,
+	observer::SvcEvent &event)
 {
 	++stats_.svc_calls;
 	stats_.last_syscall = number;
@@ -349,19 +354,27 @@ int64_t SvcDispatcher::dispatchSyscall(uint32_t number, const std::array<uint64_
 	int64_t value = 0;
 	if (result.has_value())
 	{
-		supported = true;
+		event.support = ctx.degraded() ? observer::SvcSupport::Degraded :
+						 observer::SvcSupport::Supported;
+		if (ctx.degraded())
+		{
+			event.degraded_reason.assign(ctx.degradedReason());
+		}
 		value = result.value();
 	}
 	else
 	{
-		supported = false;
+		event.support = observer::SvcSupport::Unsupported;
 		++stats_.unknown;
 		value = kError(kEnosys);
 	}
 	return value;
 }
 
-int64_t SvcDispatcher::invokeHostStub(uc_engine *uc, uint32_t index, const std::array<uint64_t, 8> &args, bool &supported)
+int64_t SvcDispatcher::invokeHostStub(uc_engine *uc,
+	uint32_t index,
+	const std::array<uint64_t, 8> &args,
+	observer::SvcEvent &event)
 {
 	HostCallArgs call;
 	call.x = args;
@@ -385,17 +398,23 @@ int64_t SvcDispatcher::invokeHostStub(uc_engine *uc, uint32_t index, const std::
 	// engine is nested with a full context save/restore (M0 probe 6) and the
 	// guest-side frame is capped at 32 (M0 result §6.2). M5 reuses this path.
 	call.call_guest = [this, uc](GuestVA entry, const std::array<uint64_t, 8> &guest_args) {
-		return callGuestNested(uc, entry, threads_.returnTrap(), guest_args);
+		// The nested run belongs to the host stub's call stack. Mark it so
+		// sched_yield(2) inside it does not try to hand the engine back to the
+		// scheduler, which cannot resume a nested frame.
+		++thread_.nested_call_depth;
+		auto nested = callGuestNested(uc, entry, threads_.returnTrap(), guest_args);
+		--thread_.nested_call_depth;
+		return nested;
 	};
 
 	++stats_.host_calls;
 	auto result = thunks_.invoke(index, call);
 	if (!result.ok())
 	{
-		supported = false;
+		event.support = observer::SvcSupport::Unsupported;
 		return kError(kEnosys);
 	}
-	supported = true;
+	event.support = observer::SvcSupport::Supported;
 	return result.value();
 }
 

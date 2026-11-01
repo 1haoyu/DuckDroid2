@@ -124,6 +124,12 @@ self/status,self/cmdline,self/comm,self/maps,self/mem}` 等；`readlinkat` 支�
 - `svc.log`（9 列、tab 分隔、args/note 为 JSON，可解析、可 diff 的 SVC 语义日志）、
   `MemoryEvent`、`ThreadEvent`、`ModuleEvent`、`JniEvent`、每线程 SPSC 诊断环、
   x29 帧链回溯与 `trace_viewer`。
+- `svc.log` 的 note 列区分三态：`{}`（完整实现）、
+  `{"degraded":1,"reason":"..."}`（返回了值但跳过部分语义：信号投递、
+  非线程 clone、futex bitset 掩码、文件锁、未建模的 prctl）、
+  `{"unsupported":1,...}`（没有 handler，返回 ENOSYS）。接入新目标时先
+  grep 这两类，再决定冻结、补最小语义还是升级成设计决策；清单见
+  [`docs/runtime-contract.md`](docs/runtime-contract.md)。
 - **指令级 trace**（`-DDUCKEMU_ENABLE_TRACE=ON`）：`code.log` / `bl.log` /
   `rw.log` 严格沿用 QBDI 四件套的列结构、行号和 JSON 约定，另加 `threads.tsv`
   记线程归属。目标 runner 用 `--trace DIR` 一个参数：`svc.log` 写 `DIR/svc.log`，
@@ -470,8 +476,11 @@ shadow。2026-10-31 接入抖音（futex bitset、`GetObjectRefType`、4 MiB 栈
 
 ## 已知限制
 
-- 单核串行：父线程在 guest 里死循环会饿死子线程；没有抢占，生产超时靠
-  System/Worker 对实例进程 `SIGKILL`。
+- 单核串行：父线程在 guest 里死循环会饿死子线程；`sched_yield(2)` 现在会
+  真正释放执行锁，但调度仍是合作式，没有抢占。
+- `RuntimeConfig::default_timeout_us` 是主机发起的单次 guest 调用预算（默认
+  5 s）；超时后所有 engine 被停止，实例进入 Faulted（与 fault / exit_group
+  相同的终态）。生产路径另外由 System/Worker 对实例进程 `SIGKILL` 兜底。
 - 只验证了 Linux x86_64 宿主 + arm64 guest；16 KiB 页设备未覆盖。
 
 ## 致谢

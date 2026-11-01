@@ -91,7 +91,10 @@ class ThreadScheduler final : public ThreadSystem
 	void stop();
 
 	// Posts (entry, args) to the main guest thread and waits for the call to
-	// return, exit or fault. Refused while another call is active.
+	// return, exit or fault. Refused while another call is active. A
+	// non-zero default_timeout_us bounds the wait: on expiry every engine is
+	// stopped and the instance is left stopping (a timed-out call cannot be
+	// resumed safely).
 	Result<CallResult> callFunction(GuestVA entry, const std::array<uint64_t, 8> &args);
 
 	// Serializes a host API call with guest execution: while a guest thread is
@@ -118,6 +121,7 @@ class ThreadScheduler final : public ThreadSystem
 	void exitThread(RuntimeThread &thread, int32_t code) override;
 	void exitGroup(RuntimeThread &thread, int32_t code) override;
 	void setClearChildTid(RuntimeThread &thread, GuestVA address) override;
+	void yieldThread(RuntimeThread &thread) override;
 	[[nodiscard]] bool stopping() const override
 	{
 		return stopping_.load(std::memory_order_acquire);
@@ -137,6 +141,9 @@ class ThreadScheduler final : public ThreadSystem
 	void expireDeadline(RuntimeThread &thread);
 	void reapExited();
 	void removeFromWaitQueue(RuntimeThread &thread);
+	// uc_emu_stop on every engine. Callers decide whether stopping_ is also
+	// set (stop/exit_group/timeout) or only execution is interrupted.
+	void stopAllEngines();
 
 	Result<std::unique_ptr<RuntimeThread> > createThreadObject(uint32_t tid, uint32_t parent_tid, bool is_main);
 	Result<std::unique_ptr<UnicornEngine> > createEngineFor(RuntimeThread &thread);

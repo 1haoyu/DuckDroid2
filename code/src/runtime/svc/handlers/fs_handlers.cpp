@@ -641,6 +641,9 @@ int64_t sysFcntl(SyscallContext &ctx)
 		return file->writable() ? static_cast<int64_t>(kOWrOnly) : 0;
 	}
 	case kFcntlSetFl:
+		// O_NONBLOCK and friends are not stored on the description; a guest
+		// that turns on non-blocking I/O still sees the blocking behavior.
+		ctx.degrade("fcntl F_SETFL flags are not tracked");
 		return fdIsOpen(ctx, fd) ? 0 : kError(kEbadf);
 	case kFcntlGetLk:
 	{
@@ -648,6 +651,9 @@ int64_t sysFcntl(SyscallContext &ctx)
 		{
 			return kError(kEbadf);
 		}
+		// There is no lock manager, so "unlocked" is a guess rather than an
+		// observation.
+		ctx.degrade("file locks are not modelled");
 		std::array<uint8_t, kFlockSize> lock{};
 		lock[0] = kFUnlck;
 		auto written = ctx.memory.write(GuestVA{ ctx.args[2] }, lock.data(), lock.size());
@@ -658,6 +664,7 @@ int64_t sysFcntl(SyscallContext &ctx)
 		// No lock manager: report the lock as taken. A guest that depends on
 		// cross-process exclusion would need a real one, but the runtime is
 		// process-isolated per instance.
+		ctx.degrade("file locks are not modelled");
 		return fdIsOpen(ctx, fd) ? 0 : kError(kEbadf);
 	default:
 		return kError(kEinval);

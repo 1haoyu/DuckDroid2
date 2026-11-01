@@ -43,11 +43,16 @@ duckemu_guest_blob(BLOB_TRACE_EXT
   "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/blobs/08_trace_ext.S")
 duckemu_guest_blob(BLOB_ADDRESS_HOOK
   "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/blobs/08_hook.S")
+duckemu_guest_blob(BLOB_TIMEOUT
+  "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/blobs/09_timeout.S")
+duckemu_guest_blob(BLOB_YIELD
+  "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/blobs/09_yield.S")
 
 add_custom_target(guest_blobs ALL
   DEPENDS ${BLOB_TLS_READ} ${BLOB_PURE_NATIVE} ${BLOB_EXIT_GROUP}
           ${BLOB_STACK_DUMP} ${BLOB_PTHREAD_JOIN}
-          ${BLOB_TRACE_MAIN} ${BLOB_TRACE_EXT} ${BLOB_ADDRESS_HOOK})
+          ${BLOB_TRACE_MAIN} ${BLOB_TRACE_EXT} ${BLOB_ADDRESS_HOOK}
+          ${BLOB_TIMEOUT} ${BLOB_YIELD})
 
 # ---------------------------------------------------------------------------
 # Guest shared objects for the M4 loader gate. Built for aarch64-linux-android
@@ -313,6 +318,12 @@ duckemu_add_integration_test(02_pure_native)
 duckemu_add_integration_test(02_stack_dump)
 duckemu_add_integration_test(03_pthread_join)
 duckemu_add_integration_test(08_address_hook)
+# The host-call budget is the one place a guest spin loop is bounded: the
+# blob below never returns, and the call must come back with Timeout.
+duckemu_add_integration_test(09_call_timeout)
+# A guest thread spinning on a flag with sched_yield must let the producer
+# run; without a real yield this deadlocks inside one uc_emu_start.
+duckemu_add_integration_test(09_sched_yield)
 
 # The instruction trace needs capstone; only register its gate when the
 # analysis build is enabled.

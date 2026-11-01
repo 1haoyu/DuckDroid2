@@ -89,9 +89,12 @@ bool onlyExpectedProbe(const Outcome &outcome)
 
 bool runOnce(const worker::AppContext &context, Outcome *outcome, std::string *error)
 {
-	// Same configuration the worker's instance host builds: no timeout or
-	// stack override, only the app context fields.
+	// Same configuration the worker's instance host builds, except for the
+	// call budget: the standalone dy7 runner uses 60 s, and a loaded CI host
+	// can push one signing call past the 5 s default. The worker path still
+	// has its own 5 s invoke timeout; 09_call_timeout covers the mechanism.
 	runtime::RuntimeConfig config;
+	config.default_timeout_us = 60ULL * 1000 * 1000;
 	config.library_search_paths = context.library_search_paths;
 	config.filesystem_roots = context.filesystem_roots;
 	config.property_file = context.property_file;
@@ -112,7 +115,7 @@ bool runOnce(const worker::AppContext &context, Outcome *outcome, std::string *e
 			JniEventShape{ event.kind, event.class_descriptor, event.name, event.signature });
 	});
 	instance.addSvcListener([outcome](const runtime::observer::SvcEvent &event) {
-		if (!event.supported)
+		if (event.support == runtime::observer::SvcSupport::Unsupported)
 		{
 			outcome->unsupported.push_back(event.name);
 		}

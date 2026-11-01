@@ -61,7 +61,9 @@ class SvcDispatcher
 	// UC_HOOK_INTR entry. Decodes the trapping SVC at PC - 4:
 	//   imm == 0            -> Linux syscall, number in x8, args x0..x5
 	//   imm & 0x8000        -> host stub, index = imm & 0x7fff
-	// Publishes one SvcEvent per dispatch, whether it was supported or not.
+	// Publishes one SvcEvent per dispatch. `support` says whether the answer
+	// was complete (Supported), returned a value while skipping part of the
+	// effect (Degraded), or was refused (Unsupported).
 	// A blocking syscall leaves the event on the thread (pending_event) and is
 	// published by the owner when it actually resumes.
 	void onTrap(uc_engine *uc, uint32_t intno);
@@ -81,8 +83,13 @@ class SvcDispatcher
 	}
 
     private:
-	int64_t dispatchSyscall(uint32_t number, const std::array<uint64_t, 6> &args, bool &supported);
-	int64_t invokeHostStub(uc_engine *uc, uint32_t index, const std::array<uint64_t, 8> &args, bool &supported);
+	int64_t dispatchSyscall(uint32_t number,
+		const std::array<uint64_t, 6> &args,
+		observer::SvcEvent &event);
+	int64_t invokeHostStub(uc_engine *uc,
+		uint32_t index,
+		const std::array<uint64_t, 8> &args,
+		observer::SvcEvent &event);
 	void captureStack(uc_engine *uc, observer::SvcEvent &event) const;
 	void logUnsupported(const observer::SvcEvent &event) const;
 

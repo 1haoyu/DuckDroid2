@@ -4,6 +4,7 @@
 #include "runtime/clock/runtime_clock.hpp"
 #include "runtime/svc/handler.hpp"
 #include "runtime/svc/syscall_numbers.hpp"
+#include "runtime/threads/clone/clone_flags.hpp"
 #include "runtime/threads/thread_system.hpp"
 
 namespace duckemu::runtime::svc
@@ -82,6 +83,16 @@ int64_t sysClone(SyscallContext &ctx)
 	// CONFIG_CLONE_BACKWARDS: tls precedes child_tid on arm64.
 	request.tls = GuestVA{ ctx.args[3] };
 	request.child_tid = GuestVA{ ctx.args[4] };
+
+	// Only threads exist in this runtime. A process clone (fork/vfork, e.g.
+	// popen's posix_spawn probe: stack_top == 0, CLONE_VFORK) is refused with
+	// EINVAL, but the refusal is a semantic gap, not "handled": the guest
+	// takes its fallback path. Record it so target triage can see it.
+	using namespace threads::clone_flags;
+	if ((request.flags & (kCloneVm | kCloneThread)) != (kCloneVm | kCloneThread))
+	{
+		ctx.degrade("clone without CLONE_VM|CLONE_THREAD");
+	}
 	return ctx.threads.cloneThread(ctx.thread, request);
 }
 
@@ -99,10 +110,19 @@ std::optional<int64_t> sysFutex(SyscallContext &ctx)
 	{
 		// WAIT_BITSET's val3 is the bit mask. There is one wait queue per
 		// address and every waiter matches every bit, so only the zero-mask
-		// error case needs the argument.
-		if (operation == kFutexWaitBitset && static_cast<uint32_t>(ctx.args[5]) == 0)
+		// error case needs the argument; a non-full mask is a real semantic
+		// difference (a waker may wake a waiter whose bit is not set).
+		const uint32_t bitset = static_cast<uint32_t>(ctx.args[5]);
+		if (operation == kFutexWaitBitset)
 		{
-			return kError(kEinval);
+			if (bitset == 0)
+			{
+				return kError(kEinval);
+			}
+			if (bitset != 0xFFFFFFFFu)
+			{
+				ctx.degrade("futex bitset mask is ignored");
+			}
 		}
 		int64_t error = 0;
 		auto timeout_us = futexTimeoutUs(ctx, raw_operation, ctx.args[3], &error);
@@ -114,9 +134,17 @@ std::optional<int64_t> sysFutex(SyscallContext &ctx)
 	}
 	case kFutexWake:
 	case kFutexWakeBitset:
-		if (operation == kFutexWakeBitset && static_cast<uint32_t>(ctx.args[5]) == 0)
+		if (operation == kFutexWakeBitset)
 		{
-			return kError(kEinval);
+			const uint32_t bitset = static_cast<uint32_t>(ctx.args[5]);
+			if (bitset == 0)
+			{
+				return kError(kEinval);
+			}
+			if (bitset != 0xFFFFFFFFu)
+			{
+				ctx.degrade("futex bitset mask is ignored");
+			}
 		}
 		return ctx.threads.futexWake(uaddr, static_cast<int32_t>(value));
 	default:

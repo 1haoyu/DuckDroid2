@@ -61,6 +61,12 @@ class ThreadSystem
 	virtual void exitGroup(RuntimeThread &thread, int32_t code) = 0;
 	virtual void setClearChildTid(RuntimeThread &thread, GuestVA address) = 0;
 
+	// sched_yield(2). Called inside the SVC hook on the executing thread:
+	// marks it Runnable so the dispatcher stops the engine and the owning host
+	// loop releases the execution lock. Returns immediately; the syscall still
+	// reports 0 to the guest.
+	virtual void yieldThread(RuntimeThread &thread) = 0;
+
 	[[nodiscard]] virtual bool stopping() const = 0;
 
 	// Guest address that ends a host-initiated guest call (callFunction and the

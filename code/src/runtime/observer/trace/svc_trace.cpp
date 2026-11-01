@@ -231,8 +231,29 @@ bool parseNote(std::string_view text, SvcEvent &event)
 {
 	if (text == "{}")
 	{
-		event.supported = true;
+		event.support = SvcSupport::Supported;
 		return true;
+	}
+
+	constexpr std::string_view kDegraded = "{\"degraded\":1";
+	if (text.substr(0, kDegraded.size()) == kDegraded)
+	{
+		event.support = SvcSupport::Degraded;
+		text.remove_prefix(kDegraded.size());
+
+		constexpr std::string_view kReason = ",\"reason\":\"";
+		if (text.substr(0, kReason.size()) == kReason)
+		{
+			text.remove_prefix(kReason.size());
+			const size_t end = text.find('"');
+			if (end == std::string_view::npos)
+			{
+				return false;
+			}
+			event.degraded_reason = unescapeJson(text.substr(0, end));
+			text.remove_prefix(end + 1);
+		}
+		return text == "}";
 	}
 
 	constexpr std::string_view kUnsupported = "{\"unsupported\":1";
@@ -240,7 +261,7 @@ bool parseNote(std::string_view text, SvcEvent &event)
 	{
 		return false;
 	}
-	event.supported = false;
+	event.support = SvcSupport::Unsupported;
 	text.remove_prefix(kUnsupported.size());
 
 	constexpr std::string_view kStop = ",\"stop\":\"";
@@ -357,9 +378,21 @@ std::string formatSvcTraceLine(const SvcEvent &event)
 	appendHex(line, event.result);
 	line += '\t';
 
-	if (event.supported)
+	if (event.support == SvcSupport::Supported)
 	{
 		line += "{}";
+		return line;
+	}
+
+	if (event.support == SvcSupport::Degraded)
+	{
+		line += "{\"degraded\":1";
+		if (!event.degraded_reason.empty())
+		{
+			line += ",\"reason\":";
+			line += jsonString(event.degraded_reason);
+		}
+		line += '}';
 		return line;
 	}
 

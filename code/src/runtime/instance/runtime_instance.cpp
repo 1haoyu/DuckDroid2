@@ -34,6 +34,13 @@ constexpr uint32_t kBranchToSelf = 0x14000000u; // b .
 // bionic_call_ifunc_resolver.cpp passes (HWCAP | _IFUNC_ARG_HWCAP, &arg).
 constexpr uint64_t kIfuncHwcap = 1ULL << 62;
 
+// A fault or a timed-out host call leaves the guest mid-instruction; the
+// instance cannot accept another call after either.
+bool isTerminalError(const Error &error)
+{
+	return error.code == ErrorCode::EmulationFault || error.code == ErrorCode::Timeout;
+}
+
 } // namespace
 
 struct RuntimeInstance::Impl : loader::DlService
@@ -855,7 +862,7 @@ Result<uint64_t> RuntimeInstance::loadLibrary(std::string_view path)
 		auto call = impl_->scheduler->callFunction(fixup.resolver, args);
 		if (!call.ok())
 		{
-			if (call.error().code == ErrorCode::EmulationFault)
+			if (isTerminalError(call.error()))
 			{
 				impl_->state = Impl::State::Faulted;
 			}
@@ -901,7 +908,7 @@ Result<uint64_t> RuntimeInstance::loadLibrary(std::string_view path)
 			auto called = impl_->scheduler->callFunction(cfi_init.value(), cfi_args);
 			if (!called.ok())
 			{
-				if (called.error().code == ErrorCode::EmulationFault)
+				if (isTerminalError(called.error()))
 				{
 					impl_->state = Impl::State::Faulted;
 				}
@@ -931,7 +938,7 @@ Result<uint64_t> RuntimeInstance::loadLibrary(std::string_view path)
 		auto call = impl_->scheduler->callFunction(initializer.function, {});
 		if (!call.ok())
 		{
-			if (call.error().code == ErrorCode::EmulationFault)
+			if (isTerminalError(call.error()))
 			{
 				impl_->state = Impl::State::Faulted;
 			}
@@ -962,7 +969,7 @@ Result<uint64_t> RuntimeInstance::loadLibrary(std::string_view path)
 		auto call = impl_->scheduler->callFunction(jni_on_load.value(), jni_args);
 		if (!call.ok())
 		{
-			if (call.error().code == ErrorCode::EmulationFault)
+			if (isTerminalError(call.error()))
 			{
 				impl_->state = Impl::State::Faulted;
 			}
@@ -1024,7 +1031,7 @@ Result<RuntimeInstance::CallResult> RuntimeInstance::callFunction(GuestVA entry,
 
 	auto call = impl_->scheduler->callFunction(entry, args);
 	if (!call.ok()) {
-		if (call.error().code == ErrorCode::EmulationFault) {
+		if (isTerminalError(call.error())) {
 			impl_->state = Impl::State::Faulted;
 		}
 		return call.error();

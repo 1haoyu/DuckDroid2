@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <thread>
 #include <utility>
 
 #include "common/log/logger.hpp"
 #include "runtime/backend/unicorn/unicorn_backend.hpp"
+#include "runtime/clock/runtime_clock.hpp"
 #include "runtime/debug/debug_server.hpp"
 #include "runtime/memory/address_space.hpp"
 #include "runtime/observer/event_bus.hpp"
@@ -272,9 +274,31 @@ Result<CallResult> ThreadScheduler::callFunction(GuestVA entry, const std::array
 	main_->request.entry = entry;
 	main_->request.args = args;
 	main_->cv.notify_all();
-	main_->cv.wait(lock, [this] {
-		return main_->call_done;
-	});
+
+	bool finished = true;
+	if (config_.default_timeout_us != 0)
+	{
+		finished = main_->cv.wait_for(lock,
+			std::chrono::microseconds(config_.default_timeout_us),
+			[this] { return main_->call_done; });
+	}
+	else
+	{
+		main_->cv.wait(lock, [this] { return main_->call_done; });
+	}
+
+	if (!finished && !main_->call_done)
+	{
+		// The call outlived its budget. A guest stopped mid-instruction cannot
+		// be resumed safely, so a timeout is terminal for the instance, like
+		// exit_group: stop every engine and let the host loops tear down.
+		stopping_.store(true, std::memory_order_release);
+		stopAllEngines();
+		main_->cv.wait(lock, [this] { return main_->call_done; });
+		main_->call_active = false;
+		return Error{ ErrorCode::Timeout, "guest call exceeded default_timeout_us" };
+	}
+
 	main_->call_active = false;
 
 	if (main_->call_error.has_value())
@@ -282,6 +306,26 @@ Result<CallResult> ThreadScheduler::callFunction(GuestVA entry, const std::array
 		return main_->call_error.value();
 	}
 	return main_->call_result;
+}
+
+void ThreadScheduler::stopAllEngines()
+{
+	std::vector<RuntimeThread *> all;
+	{
+		std::lock_guard<std::mutex> lock(instance_mutex_);
+		for (auto &entry : threads_)
+		{
+			all.push_back(entry.second.get());
+		}
+	}
+	for (RuntimeThread *thread : all)
+	{
+		if (thread->engine)
+		{
+			thread->engine->stop();
+		}
+		thread->cv.notify_all();
+	}
 }
 
 void ThreadScheduler::initializeMainCall(RuntimeThread &thread)
@@ -302,6 +346,8 @@ void ThreadScheduler::initializeMainCall(RuntimeThread &thread)
 		thread.pending.reset();
 		thread.pending_event.reset();
 		thread.pending_completed = false;
+		thread.pending_timeout_us = 0;
+		thread.yield_requested = false;
 	}
 
 	auto finishWithError = [&thread](const Error &error) {
@@ -488,6 +534,13 @@ void ThreadScheduler::hostThreadLoop(RuntimeThread &thread)
 			debug_->serve(thread);
 		}
 		execution.unlock();
+		if (thread.yield_requested)
+		{
+			// sched_yield(2): give a waiting engine a real chance to acquire
+			// the execution lock before this thread takes it again.
+			thread.yield_requested = false;
+			std::this_thread::yield();
+		}
 	}
 
 	finalizeThread(thread);
@@ -630,6 +683,10 @@ void ThreadScheduler::finalizeThread(RuntimeThread &thread)
 	// by whichever host thread runs reapExited().
 	if (thread.clear_child_tid != 0)
 	{
+		// CLEARTID writes guest memory: take the execution lock even though
+		// this host thread has left its run loop, so the write cannot race an
+		// engine that is executing under the single-CPU invariant.
+		auto execution = lockExecution();
 		const uint32_t zero = 0;
 		(void)memory_.write(GuestVA{ thread.clear_child_tid }, &zero, sizeof(zero));
 		(void)futexWake(GuestVA{ thread.clear_child_tid }, 1);
@@ -699,7 +756,7 @@ int64_t ThreadScheduler::cloneThread(RuntimeThread &parent, const CloneRequest &
 
 	if ((request.flags & (kCloneVm | kCloneThread)) != (kCloneVm | kCloneThread))
 	{
-		DUCKEMU_WARN("clone(flags=0x%llx) without CLONE_VM|CLONE_THREAD is not supported",
+		DUCKEMU_DEBUG("clone(flags=0x%llx) without CLONE_VM|CLONE_THREAD is not supported",
 			static_cast<unsigned long long>(request.flags));
 		return svc::kError(svc::kEinval);
 	}
@@ -804,6 +861,7 @@ int64_t ThreadScheduler::futexWait(RuntimeThread &thread,
 		thread.futex_key = uaddr.value();
 		thread.has_deadline = timeout_us != 0;
 		thread.deadline_expired = false;
+		thread.pending_timeout_us = timeout_us;
 		if (timeout_us != 0)
 		{
 			thread.deadline =
@@ -832,6 +890,7 @@ int64_t ThreadScheduler::parkThread(RuntimeThread &thread,
 		thread.state = ThreadState::Blocked;
 		thread.has_deadline = timeout_us != 0;
 		thread.deadline_expired = false;
+		thread.pending_timeout_us = timeout_us;
 		if (timeout_us != 0)
 		{
 			thread.deadline =
@@ -860,6 +919,7 @@ bool ThreadScheduler::wakeThread(RuntimeThread &thread, WakeReason reason)
 		thread.pending_completed = true;
 		thread.has_deadline = false;
 		thread.deadline_expired = false;
+		thread.pending_timeout_us = 0;
 		thread.futex_key = 0;
 		thread.state = ThreadState::Runnable;
 	}
@@ -871,6 +931,7 @@ bool ThreadScheduler::wakeThread(RuntimeThread &thread, WakeReason reason)
 void ThreadScheduler::expireDeadline(RuntimeThread &thread)
 {
 	uint64_t futex_key = 0;
+	uint64_t waited_us = 0;
 	{
 		std::lock_guard<std::mutex> lock(thread.mutex);
 		if (!thread.deadline_expired)
@@ -893,8 +954,19 @@ void ThreadScheduler::expireDeadline(RuntimeThread &thread)
 		}
 		thread.pending_result = result.value();
 		thread.pending_completed = true;
+		waited_us = thread.pending_timeout_us;
+		thread.pending_timeout_us = 0;
 		futex_key = thread.futex_key;
 		thread.futex_key = 0;
+	}
+	if (waited_us != 0 && config_.clock != nullptr)
+	{
+		// The host really waited out the deadline. Injected clocks do not
+		// follow host time, so move them by the requested duration; otherwise
+		// the guest sees a timeout while its own clock reports no time passed.
+		constexpr uint64_t kMaxTimeoutUs = UINT64_MAX / 1000;
+		config_.clock->advanceInjected(waited_us > kMaxTimeoutUs ? UINT64_MAX :
+									       waited_us * 1000);
 	}
 	if (futex_key != 0)
 	{
@@ -957,6 +1029,7 @@ int64_t ThreadScheduler::futexWake(GuestVA uaddr, int32_t count)
 			thread->pending_completed = true;
 			thread->futex_key = 0;
 			thread->has_deadline = false;
+			thread->pending_timeout_us = 0;
 			thread->state = ThreadState::Runnable;
 		}
 		publishThreadEvent(observer::ThreadEventKind::Runnable, *thread);
@@ -978,23 +1051,26 @@ void ThreadScheduler::exitGroup(RuntimeThread &, int32_t code)
 {
 	exit_code_ = code;
 	stopping_.store(true, std::memory_order_release);
+	stopAllEngines();
+}
 
-	std::vector<RuntimeThread *> all;
+void ThreadScheduler::yieldThread(RuntimeThread &thread)
+{
+	if (thread.nested_call_depth != 0)
 	{
-		std::lock_guard<std::mutex> lock(instance_mutex_);
-		for (auto &entry : threads_)
-		{
-			all.push_back(entry.second.get());
-		}
+		// A host stub owns a nested uc_emu_start on this engine. There is no
+		// scheduler loop to hand control to, so keep the old "return 0 and
+		// continue" behavior instead of stopping the nested run mid-frame.
+		return;
 	}
-	for (RuntimeThread *thread : all)
-	{
-		if (thread->engine)
-		{
-			thread->engine->stop();
-		}
-		thread->cv.notify_all();
-	}
+	// Inside the SVC hook the caller is Executing. Runnable tells the
+	// dispatcher to stop the engine; the owning host loop then releases the
+	// execution lock and yields the host thread so another guest thread can
+	// take it. No other state changes: the syscall still returns 0 and the
+	// guest resumes at the instruction after svc.
+	std::lock_guard<std::mutex> lock(thread.mutex);
+	thread.state = ThreadState::Runnable;
+	thread.yield_requested = true;
 }
 
 void ThreadScheduler::setClearChildTid(RuntimeThread &thread, GuestVA address)

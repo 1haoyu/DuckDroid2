@@ -74,6 +74,18 @@ void RuntimeClock::advanceSleep(uint64_t ns)
 	}
 }
 
+void RuntimeClock::advanceInjected(uint64_t ns)
+{
+	if (wall_injected_)
+	{
+		wall_ns_ = saturatingAdd(wall_ns_, ns);
+	}
+	if (monotonic_injected_)
+	{
+		monotonic_ns_ = saturatingAdd(monotonic_ns_, ns);
+	}
+}
+
 void RuntimeClock::setWallTimeNs(uint64_t ns)
 {
 	wall_ns_ = ns;

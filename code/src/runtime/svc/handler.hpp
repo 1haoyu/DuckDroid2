@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <string_view>
 
 #include "runtime/device/device_profile.hpp"
 #include "runtime/memory/address_space.hpp"
@@ -44,6 +46,28 @@ struct SyscallContext
 	const device::DeviceProfile &device;
 	// Instance entropy stream shared with /dev/{u,}random.
 	RandomSource &random;
+	// Set by a handler that answers the call but skips part of its effect.
+	// The dispatcher turns this into SvcSupport::Degraded; the reason travels
+	// to svc.log so a target's fallback path is visible without reading code.
+	bool degraded_flag = false;
+	std::string degraded_reason{};
+
+	void degrade(std::string_view reason)
+	{
+		degraded_flag = true;
+		if (!reason.empty())
+		{
+			degraded_reason.assign(reason);
+		}
+	}
+	[[nodiscard]] bool degraded() const noexcept
+	{
+		return degraded_flag;
+	}
+	[[nodiscard]] std::string_view degradedReason() const noexcept
+	{
+		return degraded_reason;
+	}
 };
 
 // Each subsystem returns nullopt for "not my syscall"; the dispatcher then

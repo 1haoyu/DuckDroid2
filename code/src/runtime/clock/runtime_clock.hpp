@@ -28,6 +28,11 @@ class RuntimeClock
 	// sleep offset so the guest never sees less time pass than it asked for.
 	void advanceSleep(uint64_t ns);
 
+	// Moves only the injected clocks. Used when the host really waited (a
+	// futex/poll deadline): a host clock already advanced by wall time, but an
+	// injected clock would otherwise report that no time passed.
+	void advanceInjected(uint64_t ns);
+
 	void setWallTimeNs(uint64_t ns);
 	void setMonotonicTimeNs(uint64_t ns);
 	void useHostWallClock();

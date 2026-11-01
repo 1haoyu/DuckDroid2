@@ -131,7 +131,7 @@ void runStackDump() {
     CHECK(record.kind == observer::SvcKind::Syscall);
     CHECK(record.name == "io_setup");
     CHECK_EQ(record.tid, kTid);
-    CHECK(!record.supported);
+    CHECK(record.support == observer::SvcSupport::Unsupported);
     CHECK_EQ(record.result, enosys);
     CHECK(record.stack_stop == "fp=0");
 

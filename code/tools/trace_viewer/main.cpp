@@ -98,7 +98,7 @@ int commandSummary(const char* path) {
     std::map<uint32_t, size_t> by_tid;
     std::map<std::string, size_t> by_kind;
     for (const auto& record : loaded.records) {
-        if (!record.supported) {
+        if (record.support == duckemu::runtime::observer::SvcSupport::Unsupported) {
             ++unsupported;
         }
         ++by_name[record.name];
@@ -145,7 +145,7 @@ int commandList(const char* path, const std::optional<std::string>& name,
         if (tid.has_value() && record.tid != *tid) {
             continue;
         }
-        if (unsupported_only && record.supported) {
+        if (unsupported_only && record.support != duckemu::runtime::observer::SvcSupport::Unsupported) {
             continue;
         }
         printRecord(record);
