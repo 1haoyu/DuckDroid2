@@ -11,10 +11,11 @@ A C++ user-mode Android ARM64 emulation runtime (an unidbg-style reimplementatio
 > 多实例服务对外提供。与 [unidbg](https://github.com/zhkl0228/unidbg) 思路同源，但实现是
 > 独立的 C++ 重写，不共享代码。
 
-**当前状态（2026-10-30）：M0–M8 全部通过；生产构建 47/47 tests，分析构建
-（`-DDUCKEMU_ENABLE_TRACE=ON`）50/50。** 三个真实目标已接入：libeleven、
-京东 16.1.50、得物 6.1.5.10。System → Worker → RuntimeInstance 的服务链路跑通，
-并附带一个最小的 FastAPI HTTP 案例；分析面有指令级 trace 与绝对地址 hook。
+**当前状态（2026-11-01）：M0–M8 全部通过，M9 调试面垂直切片已通；生产构建
+49/49 tests，分析构建（`-DDUCKEMU_ENABLE_TRACE=ON`）52/52。** 四个真实目标已接入：
+libeleven、京东 16.1.50、得物 6.1.5.10、抖音 40.8.0。System → Worker →
+RuntimeInstance 的服务链路跑通，并附带一个最小的 FastAPI HTTP 案例；分析面有
+指令级 trace、绝对地址 hook 与 GDB RSP 远程调试（Binary Ninja / gdb）。
 路线图见 [docs/里程碑.md](docs/里程碑.md)。
 
 ---
@@ -139,6 +140,23 @@ self/status,self/cmdline,self/comm,self/maps,self/mem}` 等；`readlinkat` 支�
 - **回放**:这个东西就没必要实现，因为你把随机和时间戳固定下来，参数一样的情况下，不可能变化的，所以没必要再做一个所谓的回放和dump运行时内存
 - **hook**:只做原生的，在执行的代码更高层做hook，不做那种直接侵入执行代码的
 
+### 调试面（GDB RSP，M9）
+
+- **模型 A（调试驱动）**：runner 加 `--debug`（默认 `127.0.0.1:31337`，
+  `--debug-port` 覆盖）后停在目标入口，由 gdb / Binary Ninja / lldb 通过
+  GDB Remote Serial Protocol 驱动；一次会话 = 一次目标调用。
+- 已实现：`g`/`G`/`p`/`P`、`m`/`M`/`X`、`Z0` 断点、`s`/`c`/`vCont`、
+  线程查询、`qXfer:{features,libraries,memory-map}`、detach。
+- 断点复用绝对地址 hook：Unicorn 的 code hook 停在指令执行**之前**
+  （Probe 12A），所以不需要回写 PC，也不需要用 `BRK` 改写指令——后者在
+  Unicorn 里会卡在原地址反复重试（Probe 12B）。
+- 单步用 `uc_emu_start(count=1)`，不装逐指令 hook。计数运行和新增断点前会
+  失效 TB 缓存：Unicorn 不会为后加的 hook 自动重译已缓存的 TB。
+- 包日志默认写 `/tmp/<可执行文件名>-gdb.log`，控制台只留一行监听提示。
+- **默认不编译**：`-DDUCKEMU_ENABLE_DEBUG=ON` 才编入；生产构建里
+  `startDebugServer()` 返回 `Unsupported`。只在 `--debug` 时监听，只绑
+  `127.0.0.1`，不经过 Worker/System。
+
 ### 真实目标
 
 | 目标          | 入口                                                | 结果                                                                                                                                   |
@@ -146,6 +164,7 @@ self/status,self/cmdline,self/comm,self/maps,self/mem}` 等；`readlinkat` 支�
 | libeleven     | `ChallengeElevenFragment.data(I)Ljava/lang/String;` | 输出 `n:<epoch_ms>`；`data(1..100)` 的 `n:` 段与参考 runner 逐值一致                                                                   |
 | 京东 16.1.50  | `Bridge.main(101)`                                  | 同一注入时钟下与 DuckDroid 参考 runner 逐字节一致；带 9 条目精简 APK 与 Mi 8 属性画像（SDK 32）                                        |
 | 得物 6.1.5.10 | `SzSdk.lf([BZZZ)[B`                                 | 挂真机 APK 后 body 长度 3263 与抓包一致；注入时钟 + 种子后 3183 跨进程逐字节复现；端到端 `/call` HTTP 200 / `c=10000`，解出 92 字符 sk |
+| 抖音 40.8.0   | `k3.a`（`god7(url, headers)`）                      | 输出七组头；同一 `DY_WALL_TIME_MS` 下 X-Argus / X-Khronos 与参考 runner 一致                                                            |
 
 ## 尚未实现
 
@@ -160,6 +179,9 @@ self/status,self/cmdline,self/comm,self/maps,self/mem}` 等；`readlinkat` 支�
 - **严格 CFI**：shadow 是零表，`__loader_cfi_fail` 被绑成返回桩，检查被跳过而不是按真机终止(这个案例非常非常少，懒得去专门维护了)。
 - **回溯**：x29 帧链不是 CFI/DWARF；release so 默认 omit-frame-pointer，链会很短。
 - **16 KiB 页**：只在 4 KiB 页上验证(能跑就行，以后有时间再写)。
+- **调试面**：只支持调试驱动模型（不能在目标跑一半时附加）；watchpoint
+  （Z2–Z4）回 `E01`，thunk 页断点、嵌套帧断点、信号投递与 DWARF 回溯都还没有；
+  `--debug` 需要 `-DDUCKEMU_ENABLE_DEBUG=ON` 构建。
 
 ## 架构
 
@@ -215,13 +237,14 @@ code/
 │   ├── random/              # RandomSource
 │   ├── jni/                 # JNIEnv/JavaVM、JavaWorld、JavaBinder、refs、envs
 │   ├── clock/               # RuntimeClock
+│   ├── debug/               # M9：GDB RSP 调试面（默认不编译）
 │   └── observer/            # 语义事件、诊断环、svc.log、guest 栈回溯
 ├── src/worker/              # Worker supervisor、实例进程、AppPlugin
 ├── src/system/              # UDS 网关、WorkerPool
 ├── src/web/                 # FastAPI 最小 HTTP 案例
 ├── user_code/               # 目标项目（libeleven_case、jdgs_case、szstone_case、dy7_case）与注册表
 ├── tests/                   # integration + unit（49 个）
-├── tools/spike/             # M0 的 Unicorn 九条探针
+├── tools/spike/             # M0/M8/M9 探针（Unicorn 语义、gdb_spike）
 ├── tools/trace_viewer/      # svc.log 查看器
 └── tools/sign_client/       # UDS 客户端与压测
 docs/
@@ -284,9 +307,19 @@ cmake --build build-trace -j"$(nproc)"
 # 一次京东 main(101) 实测：code.log 1,171,888 行 / 129 MiB，
 # rw.log 2,155,668 行 / 132 MiB，合计约 261 MiB（约 5.2 s）。
 # trace_logs/ 已在 .gitignore 中。
+
+# 分析构建：GDB RSP 调试面（生产构建不含）
+cmake -S code -B build-dbg -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DDUCKEMU_ENABLE_DEBUG=ON
+cmake --build build-dbg -j"$(nproc)"
+
+# libeleven 停在入口，等 gdb / Binary Ninja 连 127.0.0.1:31337
+./build-dbg/user_code/duckemu_libeleven_case --debug
+# gdb -q -ex 'set architecture aarch64' -ex 'target remote 127.0.0.1:31337'
+# 包日志：/tmp/duckemu_libeleven_case-gdb.log
 ```
 
-当前 47 个测试（生产构建；`DUCKEMU_ENABLE_TRACE=ON` 为 50），按阶段分组：
+当前 49 个测试（生产构建；`DUCKEMU_ENABLE_TRACE=ON` 为 52），按阶段分组：
 
 - 探针：`m0_probes`
 - 裸 blob：`01_tls_read`、`02_pure_native`、`02_stack_dump`、`03_pthread_join`
@@ -388,6 +421,7 @@ libeleven 很简单（基本是魔改 base64），这组数字只说明链路通
 | M6 真实目标      | libeleven / 京东 / 得物 / 抖音结果一致    | `06_clock_injection`、`07e_jdgs_plugin`、`07f_szstone_plugin`、`07g_dy7_plugin` | ✅   |
 | M7 服务化        | System/Worker/Instance、UDS、warm pool    | `07_end_to_end`                                                                 | ✅   |
 | M8 分析面        | 指令级 trace（LR 结尾）、绝对地址 hook    | `insn_decode_test`、`08_insn_trace`、`08_insn_trace_threads`、`08_address_hook` | ✅   |
+| M9 调试面        | GDB RSP（Binary Ninja / gdb）             | `09_gdb_*`（待补）；libeleven 手工验收已过                                      | 🟨   |
 
 执行规则：一个里程碑 = 一个可 review 的 PR；gate 是测试文件，不是口头结论；
 不提前实现下一阶段的抽象。M6 的 reset 语义由 `07d_session_reset` 覆盖
@@ -397,6 +431,8 @@ M7 之后的工作按“下一个真实目标缺什么补什么”推进。2026-
 动态 `dlopen` 与 fd 基础、可写 VFS 沙箱与事件循环、`DeviceProfile`、属性区、
 `/dev` 字符节点、审计 #3/#5/#7（readlinkat/RNG/statfs）、得物接入与 CFI
 shadow。2026-10-31 接入抖音（futex bitset、`GetObjectRefType`、4 MiB 栈）。
+2026-11-01 起 M9 调试面：GDB RSP 在 libeleven 上跑通（入口停、单步、任意地址
+断点、continue、detach），Binary Ninja 端与 `09_*` gate 待补。
 已知最大缺口是目录 fd + `getdents64`；下一个目标（快手）接入时按实际踩到的面补。
 
 ## 设计文档
@@ -427,6 +463,7 @@ shadow。2026-10-31 接入抖音（futex bitset、`GetObjectRefType`、4 MiB 栈
   - [审计 #3/#5/#7](docs/devlogs/2026-10-30-26-审计3-5-7.md)
   - [得物 szstone 接入与 CFI](docs/devlogs/2026-10-30-27-得物szstone接入与CFI.md)
   - [抖音 dy7 接入](docs/devlogs/2026-10-31-31-抖音dy7接入.md)
+  - [M9 设计：GDB 远程调试](docs/devlogs/2026-11-01-33-M9设计-GDB远程调试.md)
 - [DuckDroid2 与 unidbg 的四种取舍](docs/DuckDroid2与unidbg-四种取舍.md)
 - [docs/目录说明.md](docs/目录说明.md) —— 目标目录结构与分层约束
 - [code/user_code/ENVIRONMENT.md](code/user_code/ENVIRONMENT.md) —— 目标项目的 Java 环境写法
@@ -435,16 +472,7 @@ shadow。2026-10-31 接入抖音（futex bitset、`GetObjectRefType`、4 MiB 栈
 
 - 单核串行：父线程在 guest 里死循环会饿死子线程；没有抢占，生产超时靠
   System/Worker 对实例进程 `SIGKILL`。
-- Unicorn 的 `timeout` 参数已弃用（其超时线程与下一轮运行存在竞态）；
-  DuckDroid2 统一传 `timeout = 0`。
-- 绑定 ROM：`libc_shared_globals` 偏移、静态 TLS 布局、clone 语义都跟当前
-  LineageOS 21 / `lemonade` 走；换 ROM 要重新核对。
 - 只验证了 Linux x86_64 宿主 + arm64 guest；16 KiB 页设备未覆盖。
-- 真实目标只有 libeleven、京东 16.1.50 与得物 6.1.5.10 三个；libeleven 很简单，
-  京东单次约 100 ms guest CPU，性能基线不代表复杂 so。
-- 京东的精简 APK 与得物真机 APK 不入库（`.gitignore` 排除 `*.apk`），新克隆需
-  自行放置；得物的设备快照与属性画像在 `code/user_code/szstone_case/`。
-- 没有和 unidbg 做同目标、同输入、同机器的性能对拍。
 
 ## 致谢
 
