@@ -145,10 +145,19 @@ add_library(duckemu_runtime STATIC
   src/runtime/random/random_source.cpp
   src/runtime/vfs/runtime_vfs.cpp
   src/runtime/vfs/file.cpp
+  src/runtime/vfs/dir_cursor.cpp
+  src/runtime/vfs/dir_file.cpp
   src/runtime/vfs/fd_table.cpp
   src/runtime/vfs/dev_file_system.cpp
   src/runtime/vfs/event_file.cpp
   src/runtime/vfs/proc_fs.cpp
+  src/runtime/vfs/backend.cpp
+  src/runtime/vfs/mount_table.cpp
+  src/runtime/vfs/backends/host_ro_fs.cpp
+  src/runtime/vfs/backends/sandbox_fs.cpp
+  src/runtime/vfs/backends/overlay_fs.cpp
+  src/runtime/vfs/backends/proc_fs.cpp
+  src/runtime/vfs/backends/synthetic_mount_fs.cpp
   src/runtime/vfs/virtual_file_system.cpp
   src/runtime/backend/unicorn/unicorn_engine.cpp
   src/runtime/backend/unicorn/unicorn_backend.cpp

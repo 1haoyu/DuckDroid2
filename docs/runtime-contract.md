@@ -1,6 +1,6 @@
 # Runtime 契约：syscall 三态清单
 
-> 最后更新：2026-11-01。这张表的目标不是"列全 Linux"，而是让每个目标的
+> 最后更新：2026-11-02。这张表的目标不是"列全 Linux"，而是让每个目标的
 > 接入结果可比较：同一个 syscall 在四个目标里是完整实现、降级还是不支持，
 > 必须能一眼看出来。
 >
@@ -39,12 +39,41 @@
 - **进程**：`fork`、`vfork`、`execve`、`wait4`、`setpgid`、`getpgid`。
   进程级 clone 走上面的 degraded 分支。若目标依赖子进程成功，应在 Worker
   层实现，不改线程调度器。
-- **目录遍历**：`getdents64`、`openat(O_DIRECTORY)` 后的目录描述。
 - **io 变体**：`readv`、`writev`、`preadv`、`pwritev`、`sendfile`、`splice`、
-  `tee`。
+  `tee`。`pread64`/`pwrite64` 已实现（M10）。
 - **futex 其他操作**：PI、requeue、`*_OP`。
 - **其余 ioctl 请求**：`ioctl(2)` 本身是 Supported（打开的 fd 返回 `ENOTTY`，
   未知 fd 返回 `EBADF`），但没有任何请求被具体建模。
+
+## VFS 语义（M10）
+
+固定的命名空间：`/` = `OverlayFs(upper=可写沙箱, lower=只读宿主根…)`，
+`/proc` = `ProcFs(宿主快照优先 + 合成回落)`，`/dev`、`/dev/__properties__`
+= 合成只读挂载。匹配按 guest 路径最长前缀。
+
+- **覆盖层**：读按 upper → lower 顺序；变更只落 upper。
+  - 只在 lower 的删除/重命名/写意图 open → `EROFS`。
+  - 删除 upper 且 lower 同名 → 记录实例内内存白障，lower 副本不再出现；
+    实例回收 = 换进程，白障不持久化。
+  - 跨挂载 `renameat` → `EXDEV`；同挂载 rename 不改变 `st_ino`。
+  - `O_CREAT` 命中 lower 时复制到 upper 并遮蔽；`O_EXCL|O_CREAT` 命中
+    lower → `EEXIST`；无 `O_CREAT` 的写意图 → `EROFS`。
+- **身份**：宿主节点用宿主 `st_dev/st_ino`；合成节点用
+  `hash64(mount_id, guest_path)`。`getdents64` 的 `d_ino` 与随后
+  `fstatat` 的 `st_ino` 一致。
+- **目录**：`open` 目录得到快照描述（首次打开时快照，关闭即释放）。
+  `getdents64` 的 `d_off = index+1`；部分 buffer 不消费未写出的条目；
+  首条放不下 → `EINVAL`；EOF → 0；`lseek(fd, 0, SEEK_SET)` 复位；
+  `dup` 共享游标。子挂载点（`/proc`、`/dev`、`/dev/__properties__`）会
+  出现在父目录列表里。
+- **dirfd**：`openat/fstatat/faccessat/unlinkat/renameat/mkdirat/readlinkat`
+  接受目录 fd；`AT_FDCWD` 表示 `/`；非目录 fd → `ENOTDIR`，未打开 → `EBADF`；
+  `..` 在根处夹断。
+- **stdio**：0/1/2 是描述符表里的永久条目；`close(0/1/2)` 返回 0 但不丢弃，
+  `dup(1)` 共享宿主 stdout，`F_GETFL` 返回真实访问模式与 `O_APPEND`。
+- **错误保真**：后端在入口只翻译一次 errno，可写 open 不再折叠成 `EACCES`；
+  `ENOENT/EISDIR/EROFS/EEXIST/EXDEV` 都可区分。`renameat2` 已支持 flags=0
+  的形式（现代 bionic 的 `rename(3)` 会用到）。
 
 ## 已知的"值级近似"（未标 degraded）
 

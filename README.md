@@ -11,11 +11,12 @@ A C++ user-mode Android ARM64 emulation runtime (an unidbg-style reimplementatio
 > 多实例服务对外提供。与 [unidbg](https://github.com/zhkl0228/unidbg) 思路同源，但实现是
 > 独立的 C++ 重写，不共享代码。
 
-**当前状态（2026-11-01）：M0–M8 全部通过，M9 调试面垂直切片已通；生产构建
-49/49 tests，分析构建（`-DDUCKEMU_ENABLE_TRACE=ON`）52/52。** 四个真实目标已接入：
+**当前状态（2026-11-02）：M0–M8、M10 全部通过，M9 调试面垂直切片已通；生产构建
+57/57 tests，分析构建（`-DDUCKEMU_ENABLE_TRACE=ON`）60/60。** 四个真实目标已接入：
 libeleven、京东 16.1.50、得物 6.1.5.10、抖音 40.8.0。System → Worker →
 RuntimeInstance 的服务链路跑通，并附带一个最小的 FastAPI HTTP 案例；分析面有
-指令级 trace、绝对地址 hook 与 GDB RSP 远程调试（Binary Ninja / gdb）。
+指令级 trace、绝对地址 hook 与 GDB RSP 远程调试（Binary Ninja / gdb）；VFS 已是
+挂载表 + 覆盖层/合成后端，支持目录 fd、`getdents64`、`pwrite64` 与 dirfd 相对路径。
 路线图见 [docs/里程碑.md](docs/里程碑.md)。
 
 ---
@@ -325,7 +326,7 @@ cmake --build build-dbg -j"$(nproc)"
 # 包日志：/tmp/duckemu_libeleven_case-gdb.log
 ```
 
-当前 49 个测试（生产构建；`DUCKEMU_ENABLE_TRACE=ON` 为 52），按阶段分组：
+当前 57 个测试（生产构建；`DUCKEMU_ENABLE_TRACE=ON` 为 60），按阶段分组：
 
 - 探针：`m0_probes`
 - 裸 blob：`01_tls_read`、`02_pure_native`、`02_stack_dump`、`03_pthread_join`
@@ -341,6 +342,8 @@ cmake --build build-dbg -j"$(nproc)"
   `07g_dy7_plugin`
 - 分析面：`08_address_hook`；TRACE=ON 另有 `08_insn_trace`、
   `08_insn_trace_threads`、`insn_decode_test`
+- VFS 重构：`10a_vfs_contract`、`10b_vfs_mounts`、`10c_vfs_open_description`、
+  `10d_vfs_dirent`、`10e_vfs_dirfd`
 - 单元：`elf_image_test`、`runtime_memory_test`、`ring_buffer_test`、
   `guest_stack_test`、`svc_trace_format_test`、`protocol_test`、`jni_world_test`、
   `jni_layout_test`、`runtime_clock_test`、`module_missing_dep_test`

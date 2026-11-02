@@ -193,6 +193,18 @@ add_custom_command(
     DEPENDS "${DUCKEMU_SO_SOURCE_DIR}/libwr.c"
     COMMENT "Building guest .so libwr.so")
 
+# M10: one raw SVC trampoline for syscalls bionic does not export as
+# functions (getdents64, and any new number the VFS gates need).
+add_custom_command(
+    OUTPUT "${DUCKEMU_SO_BUILD_DIR}/libvfsraw.so"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DUCKEMU_SO_BUILD_DIR}"
+    COMMAND ${DUCKEMU_CLANG_EXECUTABLE} ${DUCKEMU_GUEST_SO_FLAGS}
+            -fno-stack-protector -fno-builtin
+            -Wl,-soname,libvfsraw.so "${DUCKEMU_SO_SOURCE_DIR}/libvfsraw.c"
+            -o "${DUCKEMU_SO_BUILD_DIR}/libvfsraw.so"
+    DEPENDS "${DUCKEMU_SO_SOURCE_DIR}/libvfsraw.c"
+    COMMENT "Building guest .so libvfsraw.so")
+
 # 04g_event_loop: raw-syscall fixture for eventfd/timerfd/poll/epoll.
 add_custom_command(
     OUTPUT "${DUCKEMU_SO_BUILD_DIR}/libev.so"
@@ -235,6 +247,7 @@ add_custom_command(
            "${DUCKEMU_SO_RUNTIME_DIR}/libwr.so"
            "${DUCKEMU_SO_RUNTIME_DIR}/libev.so"
            "${DUCKEMU_SO_RUNTIME_DIR}/libdev.so"
+           "${DUCKEMU_SO_RUNTIME_DIR}/libvfsraw.so"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DUCKEMU_SO_RUNTIME_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DUCKEMU_SO_BUILD_DIR}/liba.so" "${DUCKEMU_SO_RUNTIME_DIR}/liba.so"
@@ -262,6 +275,8 @@ add_custom_command(
             "${DUCKEMU_SO_BUILD_DIR}/libev.so" "${DUCKEMU_SO_RUNTIME_DIR}/libev.so"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DUCKEMU_SO_BUILD_DIR}/libdev.so" "${DUCKEMU_SO_RUNTIME_DIR}/libdev.so"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DUCKEMU_SO_BUILD_DIR}/libvfsraw.so" "${DUCKEMU_SO_RUNTIME_DIR}/libvfsraw.so"
     DEPENDS "${DUCKEMU_SO_BUILD_DIR}/liba.so"
             "${DUCKEMU_SO_BUILD_DIR}/libb.so"
             "${DUCKEMU_SO_BUILD_DIR}/libmissing.so"
@@ -273,7 +288,8 @@ add_custom_command(
             "${DUCKEMU_SO_BUILD_DIR}/libfd.so"
             "${DUCKEMU_SO_BUILD_DIR}/libwr.so"
             "${DUCKEMU_SO_BUILD_DIR}/libev.so"
-            "${DUCKEMU_SO_BUILD_DIR}/libdev.so")
+            "${DUCKEMU_SO_BUILD_DIR}/libdev.so"
+            "${DUCKEMU_SO_BUILD_DIR}/libvfsraw.so")
 
 add_custom_target(guest_so ALL
     DEPENDS "${DUCKEMU_SO_RUNTIME_DIR}/liba.so"
@@ -287,7 +303,8 @@ add_custom_target(guest_so ALL
             "${DUCKEMU_SO_RUNTIME_DIR}/libfd.so"
             "${DUCKEMU_SO_RUNTIME_DIR}/libwr.so"
             "${DUCKEMU_SO_RUNTIME_DIR}/libev.so"
-            "${DUCKEMU_SO_RUNTIME_DIR}/libdev.so")
+            "${DUCKEMU_SO_RUNTIME_DIR}/libdev.so"
+            "${DUCKEMU_SO_RUNTIME_DIR}/libvfsraw.so")
 
 # ---------------------------------------------------------------------------
 # Test support
@@ -615,6 +632,76 @@ target_compile_definitions(04m_statfs PRIVATE
 add_test(NAME 04m_statfs COMMAND 04m_statfs)
 set_tests_properties(04m_statfs PROPERTIES TIMEOUT 120)
 duckemu_set_warnings(04m_statfs)
+
+# M10 S0: VFS contract baseline. Drives the ROM libc against a host root, a
+# writable sandbox and the synthetic mounts; every assertion is behavior the
+# refactor must keep.
+add_executable(10a_vfs_contract integration/10a_vfs_contract.cpp)
+target_link_libraries(10a_vfs_contract PRIVATE duckemu_runtime duckemu_test_support)
+target_compile_definitions(10a_vfs_contract PRIVATE
+  DUCKEMU_TRACE_DIR="${CMAKE_CURRENT_BINARY_DIR}/traces"
+  DUCKEMU_SO_DIR="${DUCKEMU_SO_RUNTIME_DIR}"
+  DUCKEMU_ROM_BOOTSTRAP="${DUCKEMU_ROM_BOOTSTRAP}"
+  DUCKEMU_ROM_LIB64="${DUCKEMU_ROM_LIB64}")
+add_dependencies(10a_vfs_contract guest_so)
+add_test(NAME 10a_vfs_contract COMMAND 10a_vfs_contract)
+set_tests_properties(10a_vfs_contract PROPERTIES TIMEOUT 120)
+duckemu_set_warnings(10a_vfs_contract)
+
+# M10 S1: mount table, overlay precedence, synthetic shadowing, EROFS.
+add_executable(10b_vfs_mounts integration/10b_vfs_mounts.cpp)
+target_link_libraries(10b_vfs_mounts PRIVATE duckemu_runtime duckemu_test_support)
+target_compile_definitions(10b_vfs_mounts PRIVATE
+  DUCKEMU_TRACE_DIR="${CMAKE_CURRENT_BINARY_DIR}/traces"
+  DUCKEMU_SO_DIR="${DUCKEMU_SO_RUNTIME_DIR}"
+  DUCKEMU_ROM_BOOTSTRAP="${DUCKEMU_ROM_BOOTSTRAP}"
+  DUCKEMU_ROM_LIB64="${DUCKEMU_ROM_LIB64}")
+add_dependencies(10b_vfs_mounts guest_so)
+add_test(NAME 10b_vfs_mounts COMMAND 10b_vfs_mounts)
+set_tests_properties(10b_vfs_mounts PROPERTIES TIMEOUT 120)
+duckemu_set_warnings(10b_vfs_mounts)
+
+# M10 S2: independent descriptions, dup sharing, pread/pwrite, append,
+# stdio entries and open error fidelity.
+add_executable(10c_vfs_open_description integration/10c_vfs_open_description.cpp)
+target_link_libraries(10c_vfs_open_description PRIVATE duckemu_runtime duckemu_test_support)
+target_compile_definitions(10c_vfs_open_description PRIVATE
+  DUCKEMU_TRACE_DIR="${CMAKE_CURRENT_BINARY_DIR}/traces"
+  DUCKEMU_SO_DIR="${DUCKEMU_SO_RUNTIME_DIR}"
+  DUCKEMU_ROM_BOOTSTRAP="${DUCKEMU_ROM_BOOTSTRAP}"
+  DUCKEMU_ROM_LIB64="${DUCKEMU_ROM_LIB64}")
+add_dependencies(10c_vfs_open_description guest_so)
+add_test(NAME 10c_vfs_open_description COMMAND 10c_vfs_open_description)
+set_tests_properties(10c_vfs_open_description PROPERTIES TIMEOUT 120)
+duckemu_set_warnings(10c_vfs_open_description)
+
+# M10 S3: directory enumeration across all mounts, cursor semantics and the
+# overlay whiteout.
+add_executable(10d_vfs_dirent integration/10d_vfs_dirent.cpp)
+target_link_libraries(10d_vfs_dirent PRIVATE duckemu_runtime duckemu_test_support)
+target_compile_definitions(10d_vfs_dirent PRIVATE
+  DUCKEMU_TRACE_DIR="${CMAKE_CURRENT_BINARY_DIR}/traces"
+  DUCKEMU_SO_DIR="${DUCKEMU_SO_RUNTIME_DIR}"
+  DUCKEMU_ROM_BOOTSTRAP="${DUCKEMU_ROM_BOOTSTRAP}"
+  DUCKEMU_ROM_LIB64="${DUCKEMU_ROM_LIB64}")
+add_dependencies(10d_vfs_dirent guest_so)
+add_test(NAME 10d_vfs_dirent COMMAND 10d_vfs_dirent)
+set_tests_properties(10d_vfs_dirent PROPERTIES TIMEOUT 120)
+duckemu_set_warnings(10d_vfs_dirent)
+
+# M10 S4: dirfd-relative paths for the seven path syscalls, ENOTDIR/EBADF,
+# EXDEV and directory /proc/self/fd links.
+add_executable(10e_vfs_dirfd integration/10e_vfs_dirfd.cpp)
+target_link_libraries(10e_vfs_dirfd PRIVATE duckemu_runtime duckemu_test_support)
+target_compile_definitions(10e_vfs_dirfd PRIVATE
+  DUCKEMU_TRACE_DIR="${CMAKE_CURRENT_BINARY_DIR}/traces"
+  DUCKEMU_SO_DIR="${DUCKEMU_SO_RUNTIME_DIR}"
+  DUCKEMU_ROM_BOOTSTRAP="${DUCKEMU_ROM_BOOTSTRAP}"
+  DUCKEMU_ROM_LIB64="${DUCKEMU_ROM_LIB64}")
+add_dependencies(10e_vfs_dirfd guest_so)
+add_test(NAME 10e_vfs_dirfd COMMAND 10e_vfs_dirfd)
+set_tests_properties(10e_vfs_dirfd PROPERTIES TIMEOUT 120)
+duckemu_set_warnings(10e_vfs_dirfd)
 
 # M4.6 S3: VFS + /proc. A ROM symbols tree is mounted as guest "/" so the
 # read-only file mmap half of the gate has a real file to map.

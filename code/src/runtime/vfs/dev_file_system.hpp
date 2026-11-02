@@ -26,6 +26,7 @@ class DevFileSystem final : public SyntheticFileSystem
 
 	[[nodiscard]] std::optional<SyntheticNode> lookup(
 		std::string_view guest_path) const override;
+	[[nodiscard]] std::vector<DirEntry> list(std::string_view guest_dir) const override;
 
     private:
 	RandomSource *random_;

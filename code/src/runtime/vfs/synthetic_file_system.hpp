@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "runtime/vfs/dir_entry.hpp"
+
 namespace duckemu::runtime::vfs
 {
 
@@ -42,6 +44,15 @@ class SyntheticFileSystem
 
 	[[nodiscard]] virtual std::optional<SyntheticNode> lookup(
 		std::string_view guest_path) const = 0;
+
+	// Entries of a directory this mount carries. `guest_dir` is the full
+	// guest path; the default (no entries) is enough for mounts that only
+	// expose files.
+	[[nodiscard]] virtual std::vector<DirEntry> list(std::string_view guest_dir) const
+	{
+		(void)guest_dir;
+		return {};
+	}
 };
 
 } // namespace duckemu::runtime::vfs

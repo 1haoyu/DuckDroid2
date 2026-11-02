@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "runtime/props/property_files.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -56,6 +57,33 @@ std::optional<vfs::SyntheticNode> PropertyFiles::lookup(std::string_view guest_p
 		return std::nullopt;
 	}
 	return found->second;
+}
+
+std::vector<vfs::DirEntry> PropertyFiles::list(std::string_view guest_dir) const
+{
+	const std::string prefix = std::string(guest_dir) + "/";
+	std::vector<vfs::DirEntry> entries;
+	for (const auto &[path, node] : nodes_)
+	{
+		if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
+		{
+			continue;
+		}
+		const std::string_view name = std::string_view(path).substr(prefix.size());
+		if (name.find('/') != std::string_view::npos)
+		{
+			continue;
+		}
+		vfs::DirEntry entry;
+		entry.name = std::string(name);
+		entry.type = node.directory ? vfs::kDirTypeDirectory : vfs::kDirTypeRegular;
+		entries.push_back(std::move(entry));
+	}
+	std::sort(entries.begin(), entries.end(),
+		[](const vfs::DirEntry &left, const vfs::DirEntry &right) {
+			return left.name < right.name;
+		});
+	return entries;
 }
 
 } // namespace duckemu::runtime::props

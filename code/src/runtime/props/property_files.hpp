@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/error/result.hpp"
 #include "runtime/props/property_table.hpp"
@@ -24,6 +25,7 @@ class PropertyFiles final : public vfs::SyntheticFileSystem
 
 	[[nodiscard]] std::optional<vfs::SyntheticNode> lookup(
 		std::string_view guest_path) const override;
+	[[nodiscard]] std::vector<vfs::DirEntry> list(std::string_view guest_dir) const override;
 
 	[[nodiscard]] const std::string &context() const
 	{

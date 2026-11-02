@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "runtime/vfs/dev_file_system.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <sys/stat.h>
 #include <utility>
+#include <vector>
 
 #include "runtime/random/random_source.hpp"
 #include "runtime/vfs/file.hpp"
@@ -189,6 +191,42 @@ std::optional<SyntheticNode> DevFileSystem::lookup(std::string_view guest_path) 
 		return std::nullopt;
 	}
 	return found->second;
+}
+
+std::vector<DirEntry> DevFileSystem::list(std::string_view guest_dir) const
+{
+	const std::string prefix = std::string(guest_dir) + "/";
+	std::vector<DirEntry> entries;
+	for (const auto &[path, node] : nodes_)
+	{
+		if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
+		{
+			continue;
+		}
+		const std::string_view name = std::string_view(path).substr(prefix.size());
+		if (name.find('/') != std::string_view::npos)
+		{
+			continue;
+		}
+		DirEntry entry;
+		entry.name = std::string(name);
+		if (node.directory)
+		{
+			entry.type = kDirTypeDirectory;
+		}
+		else if ((node.mode & S_IFMT) == S_IFCHR)
+		{
+			entry.type = kDirTypeChar;
+		}
+		else
+		{
+			entry.type = kDirTypeRegular;
+		}
+		entries.push_back(std::move(entry));
+	}
+	std::sort(entries.begin(), entries.end(),
+		[](const DirEntry &left, const DirEntry &right) { return left.name < right.name; });
+	return entries;
 }
 
 } // namespace duckemu::runtime::vfs

@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <utility>
 
+#include "runtime/vfs/vfs_error.hpp"
+
 namespace duckemu::runtime::vfs
 {
 namespace
@@ -245,13 +247,20 @@ Result<std::unique_ptr<HostFile> > HostFile::open(std::string guest_path, std::s
 	const int fd = ::open(host_path.c_str(), O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 	{
-		return Error{ ErrorCode::Internal, "cannot open " + host_path };
+		return errnoToError(errno, "cannot open " + host_path);
 	}
 	struct stat info = {};
-	if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode))
+	if (::fstat(fd, &info) != 0)
+	{
+		const int error_number = errno;
+		::close(fd);
+		return errnoToError(error_number, "cannot stat " + host_path);
+	}
+	if (!S_ISREG(info.st_mode))
 	{
 		::close(fd);
-		return Error{ ErrorCode::Internal, "cannot stat " + host_path };
+		return Error{ S_ISDIR(info.st_mode) ? ErrorCode::IsDirectory : ErrorCode::Internal,
+			host_path + " is not a regular file" };
 	}
 	return std::unique_ptr<HostFile>(new HostFile(std::move(guest_path), fd,
 		static_cast<uint64_t>(info.st_size), false, false));
@@ -267,13 +276,20 @@ Result<std::unique_ptr<HostFile> > HostFile::openWritable(std::string guest_path
 	const int fd = ::open(host_path.c_str(), host_flags | O_CLOEXEC, static_cast<mode_t>(mode));
 	if (fd < 0)
 	{
-		return Error{ ErrorCode::Internal, "cannot open " + host_path };
+		return errnoToError(errno, "cannot open " + host_path);
 	}
 	struct stat info = {};
-	if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode))
+	if (::fstat(fd, &info) != 0)
+	{
+		const int error_number = errno;
+		::close(fd);
+		return errnoToError(error_number, "cannot stat " + host_path);
+	}
+	if (!S_ISREG(info.st_mode))
 	{
 		::close(fd);
-		return Error{ ErrorCode::Internal, "cannot stat " + host_path };
+		return Error{ S_ISDIR(info.st_mode) ? ErrorCode::IsDirectory : ErrorCode::Internal,
+			host_path + " is not a regular file" };
 	}
 	return std::unique_ptr<HostFile>(new HostFile(std::move(guest_path),
 		fd,
@@ -328,7 +344,7 @@ Result<uint64_t> HostFile::readAt(uint64_t offset, void *buffer, uint64_t count)
 		static_cast<off_t>(offset));
 	if (received < 0)
 	{
-		return ioError("pread failed");
+		return errnoToError(errno, "pread failed");
 	}
 	return static_cast<uint64_t>(received);
 }
@@ -337,7 +353,7 @@ Result<uint64_t> HostFile::write(const void *buffer, uint64_t count)
 {
 	if (!writable_)
 	{
-		return Error{ ErrorCode::Unsupported, guest_path_ + " is read-only" };
+		return Error{ ErrorCode::BadFileDescriptor, guest_path_ + " is not writable" };
 	}
 	if (count == 0)
 	{
@@ -351,10 +367,30 @@ Result<uint64_t> HostFile::write(const void *buffer, uint64_t count)
 						static_cast<off_t>(offset_));
 	if (written < 0)
 	{
-		return ioError("write failed on " + guest_path_);
+		return errnoToError(errno, "write failed on " + guest_path_);
 	}
 	offset_ += static_cast<uint64_t>(written);
 	size_ = std::max(size_, offset_);
+	return static_cast<uint64_t>(written);
+}
+
+Result<uint64_t> HostFile::writeAt(uint64_t offset, const void *buffer, uint64_t count)
+{
+	if (!writable_)
+	{
+		return Error{ ErrorCode::BadFileDescriptor, guest_path_ + " is not writable" };
+	}
+	if (count == 0)
+	{
+		return uint64_t{ 0 };
+	}
+	const ssize_t written = ::pwrite(fd_, buffer, static_cast<size_t>(count),
+		static_cast<off_t>(offset));
+	if (written < 0)
+	{
+		return errnoToError(errno, "pwrite failed on " + guest_path_);
+	}
+	size_ = std::max(size_, offset + static_cast<uint64_t>(written));
 	return static_cast<uint64_t>(written);
 }
 

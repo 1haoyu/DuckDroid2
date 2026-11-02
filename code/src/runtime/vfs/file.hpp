@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "common/error/result.hpp"
+#include "runtime/vfs/open_file.hpp"
+#include "runtime/vfs/vfs_flags.hpp"
+#include "runtime/vfs/vnode.hpp"
 
 namespace duckemu::runtime::vfs
 {
@@ -24,6 +27,7 @@ inline constexpr uint32_t kPollHup = 0x010;
 enum class FileKind : uint8_t
 {
 	Regular = 0,
+	Directory,
 	Memory,
 	Static, // immutable synthetic mount entry (/dev/__properties__)
 	Device, // character device (/dev/null, /dev/zero, /dev/urandom)
@@ -71,6 +75,17 @@ class File
 	[[nodiscard]] virtual Result<uint64_t> read(void *buffer, uint64_t count) = 0;
 	[[nodiscard]] virtual Result<uint64_t> readAt(uint64_t offset, void *buffer, uint64_t count) = 0;
 	[[nodiscard]] virtual Result<uint64_t> write(const void *buffer, uint64_t count) = 0;
+	// pwrite(2): the offset does not move the description and is independent
+	// of O_APPEND. Non-seekable descriptions answer ESPIPE.
+	[[nodiscard]] virtual Result<uint64_t> writeAt(uint64_t offset,
+		const void *buffer,
+		uint64_t count)
+	{
+		(void)offset;
+		(void)buffer;
+		(void)count;
+		return Error{ ErrorCode::NotSeekable, "pwrite on a non-seekable description" };
+	}
 	[[nodiscard]] virtual Result<uint64_t> seek(int64_t offset, int whence) = 0;
 
 	// ftruncate(2). Read-only and memory-backed descriptions answer
@@ -105,6 +120,50 @@ class File
 	{
 		return kPollIn;
 	}
+
+	// Open description state. The access mode and O_APPEND survive into
+	// fcntl(F_GETFL); O_CREAT/O_EXCL/O_TRUNC do not, like the kernel.
+	void setOpenFlags(uint64_t flags)
+	{
+		open_flags_ = statusFlags(flags);
+	}
+	[[nodiscard]] uint64_t openFlags() const
+	{
+		return open_flags_;
+	}
+	// Standard descriptors are permanently installed: close(0/1/2) succeeds
+	// without discarding them.
+	void setCloseable(bool closeable)
+	{
+		closeable_ = closeable;
+	}
+	[[nodiscard]] bool closeable() const
+	{
+		return closeable_;
+	}
+	// Synthetic nodes have no host inode; the VFS stamps the identity derived
+	// from (mount, guest path) so path stat and descriptor stat agree.
+	void setIdentity(VnodeIdentity identity)
+	{
+		identity_ = identity;
+		has_identity_ = true;
+	}
+	[[nodiscard]] bool hasIdentity() const
+	{
+		return has_identity_;
+	}
+	[[nodiscard]] VnodeIdentity identity() const
+	{
+		return identity_;
+	}
+
+    protected:
+	uint64_t open_flags_ = 0;
+
+    private:
+	bool closeable_ = true;
+	bool has_identity_ = false;
+	VnodeIdentity identity_;
 };
 
 // Host stdio (fd 0/1/2) as a descriptor-table entry. The guest-visible 0/1/2
@@ -255,6 +314,9 @@ class HostFile final : public File
 	[[nodiscard]] Result<uint64_t> read(void *buffer, uint64_t count) override;
 	[[nodiscard]] Result<uint64_t> readAt(uint64_t offset, void *buffer, uint64_t count) override;
 	[[nodiscard]] Result<uint64_t> write(const void *buffer, uint64_t count) override;
+	[[nodiscard]] Result<uint64_t> writeAt(uint64_t offset,
+		const void *buffer,
+		uint64_t count) override;
 	[[nodiscard]] Result<uint64_t> seek(int64_t offset, int whence) override;
 	[[nodiscard]] Result<void> truncate(uint64_t size) override;
 	[[nodiscard]] Result<void> sync() override;

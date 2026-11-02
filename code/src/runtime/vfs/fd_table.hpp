@@ -30,6 +30,10 @@ class FdTable
 	// Places `file` at exactly `fd`, closing whatever was there (dup2).
 	[[nodiscard]] Result<void> assign(uint64_t fd, std::shared_ptr<File> file);
 
+	// Bootstrap installation (standard descriptors). Unlike insert(), it does
+	// not skip the host-reserved 0/1/2 range.
+	[[nodiscard]] Result<void> install(uint64_t fd, std::shared_ptr<File> file);
+
 	[[nodiscard]] File *find(uint64_t fd) const;
 	[[nodiscard]] std::shared_ptr<File> shared(uint64_t fd) const;
 	Result<void> remove(uint64_t fd);

@@ -70,17 +70,13 @@ int64_t toErrno(const Error &error)
 
 uint32_t readiness(vfs::VirtualFileSystem &vfs, uint64_t fd)
 {
-	if (fd <= 2)
-	{
-		return fd == 0 ? vfs::kPollIn : vfs::kPollOut;
-	}
 	vfs::File *file = vfs.find(fd);
 	return file == nullptr ? 0 : file->pollEvents();
 }
 
 bool descriptorOpen(vfs::VirtualFileSystem &vfs, uint64_t fd)
 {
-	return fd <= 2 || vfs.find(fd) != nullptr;
+	return vfs.find(fd) != nullptr;
 }
 
 bool fdSetTest(const std::array<uint8_t, kFdSetSize> &bits, int fd)
@@ -147,10 +143,6 @@ int64_t readTimespecTimeout(RuntimeMemory &memory, uint64_t address, bool &infin
 // poll(timerfd) would sleep until the caller's own timeout.
 uint64_t capWithTimer(vfs::VirtualFileSystem &vfs, uint64_t fd, uint64_t timeout_us)
 {
-	if (fd <= 2)
-	{
-		return timeout_us;
-	}
 	vfs::File *file = vfs.find(fd);
 	if (file == nullptr || file->kind() != vfs::FileKind::Timer)
 	{
@@ -503,8 +495,10 @@ int64_t sysEventfd2(SyscallContext &ctx)
 	{
 		return kError(kEinval);
 	}
-	auto added = ctx.vfs.add(std::make_unique<vfs::EventFile>(static_cast<uint32_t>(ctx.args[0]),
-		(flags & kEfdSemaphore) != 0));
+	auto file = std::make_unique<vfs::EventFile>(static_cast<uint32_t>(ctx.args[0]),
+		(flags & kEfdSemaphore) != 0);
+	file->setOpenFlags(2); // O_RDWR
+	auto added = ctx.vfs.add(std::move(file));
 	return added.ok() ? static_cast<int64_t>(added.value()) : kError(kEnomem);
 }
 
@@ -524,7 +518,9 @@ int64_t sysTimerfdCreate(SyscallContext &ctx)
 	{
 		return kError(kEinval);
 	}
-	auto added = ctx.vfs.add(std::make_unique<vfs::TimerFile>());
+	auto file = std::make_unique<vfs::TimerFile>();
+	file->setOpenFlags(0); // O_RDONLY
+	auto added = ctx.vfs.add(std::move(file));
 	return added.ok() ? static_cast<int64_t>(added.value()) : kError(kEnomem);
 }
 
@@ -610,12 +606,16 @@ int64_t sysPipe2(SyscallContext &ctx)
 		return kError(kEfault);
 	}
 	auto buffer = std::make_shared<vfs::PipeBuffer>();
-	auto read_end = ctx.vfs.add(std::make_unique<vfs::PipeFile>(buffer, true));
+	auto read_file = std::make_unique<vfs::PipeFile>(buffer, true);
+	read_file->setOpenFlags(0); // O_RDONLY
+	auto read_end = ctx.vfs.add(std::move(read_file));
 	if (!read_end.ok())
 	{
 		return kError(kEnomem);
 	}
-	auto write_end = ctx.vfs.add(std::make_unique<vfs::PipeFile>(buffer, false));
+	auto write_file = std::make_unique<vfs::PipeFile>(buffer, false);
+	write_file->setOpenFlags(1); // O_WRONLY
+	auto write_end = ctx.vfs.add(std::move(write_file));
 	if (!write_end.ok())
 	{
 		(void)ctx.vfs.close(read_end.value());
@@ -740,7 +740,9 @@ int64_t sysEpollCreate1(SyscallContext &ctx)
 	{
 		return kError(kEinval);
 	}
-	auto added = ctx.vfs.add(std::make_unique<vfs::EpollFile>());
+	auto file = std::make_unique<vfs::EpollFile>();
+	file->setOpenFlags(0);
+	auto added = ctx.vfs.add(std::move(file));
 	return added.ok() ? static_cast<int64_t>(added.value()) : kError(kEnomem);
 }
 

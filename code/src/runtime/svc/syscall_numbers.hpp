@@ -36,6 +36,8 @@ inline constexpr uint32_t kSysLseek = 62;
 inline constexpr uint32_t kSysRead = 63;
 inline constexpr uint32_t kSysWrite = 64;
 inline constexpr uint32_t kSysPread64 = 67;
+inline constexpr uint32_t kSysPwrite64 = 68;
+inline constexpr uint32_t kSysGetdents64 = 61;
 inline constexpr uint32_t kSysPselect6 = 72;
 inline constexpr uint32_t kSysPpoll = 73;
 inline constexpr uint32_t kSysReadlinkat = 78;
@@ -79,6 +81,7 @@ inline constexpr uint32_t kSysClone = 220;
 inline constexpr uint32_t kSysMmap = 222;
 inline constexpr uint32_t kSysMprotect = 226;
 inline constexpr uint32_t kSysMadvise = 233;
+inline constexpr uint32_t kSysRenameat2 = 276;
 
 // Linux/bionic errno values (identical on host and guest).
 inline constexpr int64_t kEperm = 1;
@@ -92,6 +95,7 @@ inline constexpr int64_t kEacces = 13;
 inline constexpr int64_t kEfault = 14;
 inline constexpr int64_t kEbusy = 16;
 inline constexpr int64_t kEexist = 17;
+inline constexpr int64_t kExdev = 18;
 inline constexpr int64_t kEnodev = 19;
 inline constexpr int64_t kEinval = 22;
 inline constexpr int64_t kEnotdir = 20;

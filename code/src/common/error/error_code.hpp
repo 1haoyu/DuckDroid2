@@ -26,6 +26,8 @@ enum class ErrorCode : int {
     NotSeekable, // ESPIPE: a pipe/socket-like description
     WouldBlock,  // EAGAIN: the operation would have blocked
     Timeout,     // a host-initiated guest call exceeded its budget
+    ReadOnly,    // EROFS: a mutation on a read-only mount
+    CrossDevice, // EXDEV: a rename between different mounts
 };
 
 constexpr std::string_view to_string(ErrorCode code) noexcept {
@@ -62,6 +64,10 @@ constexpr std::string_view to_string(ErrorCode code) noexcept {
         return "would-block";
     case ErrorCode::Timeout:
         return "timeout";
+    case ErrorCode::ReadOnly:
+        return "read-only";
+    case ErrorCode::CrossDevice:
+        return "cross-device";
     }
     return "unknown";
 }

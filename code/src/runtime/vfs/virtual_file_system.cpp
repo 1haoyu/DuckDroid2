@@ -2,39 +2,33 @@
 #include "runtime/vfs/virtual_file_system.hpp"
 
 #include <algorithm>
-#include <cerrno>
-#include <fcntl.h>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
-#include <system_error>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "runtime/vfs/dir_file.hpp"
+
 #include "runtime/clock/runtime_clock.hpp"
 #include "runtime/device/device_profile.hpp"
+#include "runtime/vfs/backends/host_ro_fs.hpp"
+#include "runtime/vfs/backends/overlay_fs.hpp"
+#include "runtime/vfs/backends/proc_fs.hpp"
+#include "runtime/vfs/backends/sandbox_fs.hpp"
+#include "runtime/vfs/backends/synthetic_mount_fs.hpp"
 
 namespace duckemu::runtime::vfs
 {
 namespace
 {
 
-// Guest-visible constants (Linux arm64). The host's values match, but spelling
-// them out keeps the guest ABI independent of the build host.
 constexpr int64_t kAtFdcwd = -100;
-constexpr uint64_t kAccModeMask = 3;
-constexpr uint64_t kODirectory = 0x10000;
-constexpr uint64_t kOCreate = 0x40;
-constexpr uint64_t kOExclusive = 0x80;
-constexpr uint64_t kOTruncate = 0x200;
-constexpr uint64_t kOAppend = 0x400;
-constexpr uint64_t kAccessWrite = 2;
-constexpr uint64_t kAccessExecute = 1;
-constexpr uint64_t kAccessRead = 4;
+constexpr uint32_t kRootMountId = 1;
+constexpr uint32_t kProcMountId = 2;
+constexpr uint32_t kFirstSyntheticMountId = 3;
 
 Result<std::string> normalizePath(std::string_view path)
 {
@@ -79,71 +73,61 @@ Result<std::string> normalizePath(std::string_view path)
 	return result.empty() ? std::string("/") : result;
 }
 
-bool isWithin(const std::filesystem::path &path, const std::filesystem::path &root)
-{
-	const std::string candidate = path.string();
-	const std::string parent = root.string();
-	if (candidate == parent)
-	{
-		return true;
-	}
-	if (candidate.size() <= parent.size() || candidate.compare(0, parent.size(), parent) != 0)
-	{
-		return false;
-	}
-	return candidate[parent.size()] == '/' || parent.back() == '/';
-}
-
-Error errnoToError(int error_number, std::string message)
-{
-	switch (error_number)
-	{
-	case ENOENT:
-		return Error{ ErrorCode::NotFound, std::move(message) };
-	case EACCES:
-	case EPERM:
-	case EROFS:
-		return Error{ ErrorCode::PermissionDenied, std::move(message) };
-	case EISDIR:
-		return Error{ ErrorCode::IsDirectory, std::move(message) };
-	case ENOTDIR:
-		return Error{ ErrorCode::NotDirectory, std::move(message) };
-	case EEXIST:
-	case ENOTEMPTY:
-		return Error{ ErrorCode::AlreadyExists, std::move(message) };
-	default:
-		return Error{ ErrorCode::Internal, std::move(message) };
-	}
-}
-
-FileStat toFileStat(const struct stat &info)
-{
-	FileStat result;
-	result.device = static_cast<uint64_t>(info.st_dev);
-	result.inode = static_cast<uint64_t>(info.st_ino);
-	result.mode = static_cast<uint32_t>(info.st_mode);
-	result.link_count = static_cast<uint32_t>(info.st_nlink);
-	result.uid = static_cast<uint32_t>(info.st_uid);
-	result.gid = static_cast<uint32_t>(info.st_gid);
-	result.size = static_cast<uint64_t>(info.st_size);
-	result.blocks = static_cast<uint64_t>(info.st_blocks);
-	result.block_size = static_cast<uint32_t>(info.st_blksize);
-	result.atime_seconds = info.st_atim.tv_sec;
-	result.atime_nanoseconds = info.st_atim.tv_nsec;
-	result.mtime_seconds = info.st_mtim.tv_sec;
-	result.mtime_nanoseconds = info.st_mtim.tv_nsec;
-	result.ctime_seconds = info.st_ctim.tv_sec;
-	result.ctime_nanoseconds = info.st_ctim.tv_nsec;
-	return result;
-}
-
 } // namespace
 
 VirtualFileSystem::VirtualFileSystem(RuntimeMemory &memory, VfsConfig config)
 	: memory_(memory)
 	, config_(std::move(config))
 {
+	std::vector<HostRoFs *> lowers;
+	host_roots_.reserve(config_.host_roots.size());
+	for (const std::string &root : config_.host_roots)
+	{
+		if (root.empty())
+		{
+			continue;
+		}
+		host_roots_.push_back(std::make_unique<HostRoFs>(root));
+		lowers.push_back(host_roots_.back().get());
+	}
+	if (!config_.write_root.empty())
+	{
+		sandbox_ = std::make_unique<SandboxFs>(config_.write_root);
+	}
+	overlay_ = std::make_unique<OverlayFs>(sandbox_.get(), std::move(lowers));
+	proc_ = std::make_unique<ProcFs>(overlay_.get(), [this] { return procContext(); });
+
+	mounts_ = std::make_unique<MountTable>();
+	mounts_->add(Mount{ "", overlay_.get(), sandbox_ == nullptr, kRootMountId, false });
+	mounts_->add(Mount{ "/proc", proc_.get(), true, kProcMountId, true });
+
+	uint32_t next_mount_id = kFirstSyntheticMountId;
+	synthetic_.reserve(config_.synthetic_mounts.size());
+	for (const SyntheticMountConfig &entry : config_.synthetic_mounts)
+	{
+		if (entry.files == nullptr)
+		{
+			continue;
+		}
+		auto backend =
+			std::make_unique<SyntheticMountFs>(entry.prefix, entry.files, next_mount_id++);
+		mounts_->add(Mount{ entry.prefix, backend.get(), true,
+			static_cast<uint32_t>(next_mount_id - 1), true });
+		synthetic_.push_back(std::move(backend));
+	}
+
+	// 0/1/2 are real entries in the descriptor table; only the runtime's
+	// host-side stdio objects are permanent.
+	for (uint64_t fd = 0; fd < 3; ++fd)
+	{
+		auto file = std::make_shared<StdioFile>(static_cast<int>(fd));
+		file->setOpenFlags(fd == 0 ? 0 : 1);
+		file->setCloseable(false);
+		(void)fds_.install(fd, std::move(file));
+	}
 }
+
+VirtualFileSystem::~VirtualFileSystem() = default;
 
 Result<std::string> VirtualFileSystem::resolvePath(uint64_t dirfd, std::string_view path) const
 {
@@ -155,58 +139,33 @@ Result<std::string> VirtualFileSystem::resolvePath(uint64_t dirfd, std::string_v
 	{
 		return normalizePath(path);
 	}
+	std::string combined;
 	if (static_cast<int64_t>(dirfd) != kAtFdcwd)
 	{
-		// Directory descriptors are not modelled yet; kernels answer EBADF for
-		// a dirfd that is not open.
-		return Error{ ErrorCode::BadFileDescriptor, "relative path against a dirfd" };
+		File *directory = fds_.find(dirfd);
+		if (directory == nullptr)
+		{
+			return Error{ ErrorCode::BadFileDescriptor, "dirfd is not open" };
+		}
+		if (directory->kind() != FileKind::Directory)
+		{
+			return Error{ ErrorCode::NotDirectory, "dirfd is not a directory" };
+		}
+		combined = std::string(directory->path());
 	}
-	std::string combined = "/";
+	else
+	{
+		combined = "/";
+	}
+	combined += '/';
 	combined.append(path);
+	// ".." is clamped at the namespace root by normalizePath.
 	return normalizePath(combined);
 }
 
-Result<std::string> VirtualFileSystem::resolveWritePath(const std::string &guest_path,
-	bool create_parents) const
+Result<MountPoint> VirtualFileSystem::resolveMount(const std::string &guest_path) const
 {
-	namespace fs = std::filesystem;
-	if (config_.write_root.empty())
-	{
-		return Error{ ErrorCode::Unsupported, "no writable sandbox" };
-	}
-	std::error_code error;
-	const fs::path root = fs::weakly_canonical(fs::path(config_.write_root), error);
-	if (error)
-	{
-		return Error{ ErrorCode::Internal, "writable sandbox is unreadable" };
-	}
-	const fs::path candidate = root / guest_path.substr(1);
-	if (create_parents)
-	{
-		fs::create_directories(candidate.parent_path(), error);
-		if (error)
-		{
-			return Error{ ErrorCode::Internal, "cannot create the parent of " + guest_path };
-		}
-	}
-	// Only the parent is canonicalised: the leaf may not exist yet, but its
-	// directory must still resolve inside the sandbox after symlinks.
-	const fs::path parent = fs::weakly_canonical(candidate.parent_path(), error);
-	if (error)
-	{
-		return Error{ ErrorCode::NotFound, "cannot resolve the parent of " + guest_path };
-	}
-	const fs::path leaf = candidate.filename();
-	if (leaf.empty() || leaf == "." || leaf == "..")
-	{
-		return Error{ ErrorCode::IsDirectory, guest_path + " is a directory" };
-	}
-	const fs::path full = parent / leaf;
-	if (!isWithin(full, root))
-	{
-		return Error{ ErrorCode::PermissionDenied, guest_path + " escapes the sandbox" };
-	}
-	return full.string();
+	return mounts_->resolve(guest_path);
 }
 
 void VirtualFileSystem::applyOwner(FileStat &stat) const
@@ -229,48 +188,6 @@ void VirtualFileSystem::applyOwner(FileStat &stat) const
 	}
 }
 
-Result<VirtualFileSystem::HostPath> VirtualFileSystem::resolveHost(const std::string &guest_path) const
-{
-	namespace fs = std::filesystem;
-	std::vector<std::string> roots;
-	if (!config_.write_root.empty())
-	{
-		// The sandbox overlays the read-only roots, so a file created through
-		// open(O_CREAT) is visible to every later read and stat.
-		roots.push_back(config_.write_root);
-	}
-	for (const std::string &root : config_.host_roots)
-	{
-		roots.push_back(root);
-	}
-	for (const std::string &root : roots)
-	{
-		if (root.empty())
-		{
-			continue;
-		}
-		std::error_code error;
-		const fs::path root_path = fs::weakly_canonical(fs::path(root), error);
-		if (error)
-		{
-			continue;
-		}
-		const fs::path candidate = root_path / guest_path.substr(1);
-		const fs::file_status status = fs::status(candidate, error);
-		if (error || !fs::exists(status))
-		{
-			continue;
-		}
-		const fs::path canonical = fs::weakly_canonical(candidate, error);
-		if (error || !isWithin(canonical, root_path))
-		{
-			continue;
-		}
-		return HostPath{ canonical.string(), fs::is_directory(status) };
-	}
-	return Error{ ErrorCode::NotFound, "no such file: " + guest_path };
-}
-
 ProcContext VirtualFileSystem::procContext() const
 {
 	ProcContext context;
@@ -285,131 +202,6 @@ ProcContext VirtualFileSystem::procContext() const
 	return context;
 }
 
-std::optional<SyntheticNode> VirtualFileSystem::findSynthetic(std::string_view guest_path) const
-{
-	// Reverse order: a later mount can shadow an earlier one.
-	for (auto it = config_.synthetic_mounts.rbegin(); it != config_.synthetic_mounts.rend(); ++it)
-	{
-		if (auto node = (*it)->lookup(guest_path))
-		{
-			return node;
-		}
-	}
-	return std::nullopt;
-}
-
-uint32_t VirtualFileSystem::syntheticMode(const SyntheticNode &node)
-{
-	if (node.mode != 0)
-	{
-		return node.mode;
-	}
-	return node.directory ? (S_IFDIR | 0555) : (S_IFREG | 0444);
-}
-
-namespace
-{
-
-// A device snapshot stores process-relative proc files under self/; the guest
-// may ask for /proc/<its own pid>/x or /proc/thread-self/x instead.
-std::string hostLookupPath(std::string_view guest_path, uint32_t pid)
-{
-	if (guest_path.compare(0, 6, "/proc/") != 0)
-	{
-		return std::string(guest_path);
-	}
-	const std::string_view rest = guest_path.substr(6);
-	const size_t slash = rest.find('/');
-	if (slash == std::string_view::npos)
-	{
-		return std::string(guest_path);
-	}
-	const std::string_view component = rest.substr(0, slash);
-	if (component != std::to_string(pid) && component != "thread-self")
-	{
-		return std::string(guest_path);
-	}
-	std::string mapped = "/proc/self";
-	mapped.append(rest.substr(slash));
-	return mapped;
-}
-
-} // namespace
-
-Result<std::unique_ptr<File> > VirtualFileSystem::openPath(const std::string &guest_path,
-	uint64_t flags) const
-{
-	if (isProcPath(guest_path))
-	{
-		// A device snapshot in a host root wins, including for proc files the
-		// emulator also synthesizes (maps/status). Synthesis is the fallback
-		// for whatever the snapshot does not carry.
-		const std::string lookup = hostLookupPath(guest_path, config_.pid);
-		auto host = resolveHost(lookup);
-		if (host.ok() && !host.value().directory)
-		{
-			if ((flags & kODirectory) != 0)
-			{
-				return Error{ ErrorCode::NotDirectory, guest_path + " is not a directory" };
-			}
-			auto opened = HostFile::open(guest_path, host.value().path);
-			if (!opened.ok())
-			{
-				return opened.error();
-			}
-			return std::unique_ptr<File>(std::move(opened.value()));
-		}
-
-		auto generator = makeGenerator(guest_path, procContext());
-		if (!generator.has_value())
-		{
-			return Error{ ErrorCode::NotFound, "no such proc file: " + guest_path };
-		}
-		if ((flags & kODirectory) != 0)
-		{
-			return Error{ ErrorCode::NotDirectory, guest_path + " is not a directory" };
-		}
-		return std::unique_ptr<File>(new MemoryFile(guest_path, std::move(generator.value())));
-	}
-
-	if (auto node = findSynthetic(guest_path))
-	{
-		if (node->directory)
-		{
-			return Error{ ErrorCode::IsDirectory, guest_path + " is a directory" };
-		}
-		if ((flags & kODirectory) != 0)
-		{
-			return Error{ ErrorCode::NotDirectory, guest_path + " is not a directory" };
-		}
-		if (node->create)
-		{
-			return node->create(guest_path, flags);
-		}
-		return std::unique_ptr<File>(new StaticFile(guest_path, std::move(node->content)));
-	}
-
-	auto host = resolveHost(guest_path);
-	if (!host.ok())
-	{
-		return host.error();
-	}
-	if (host.value().directory)
-	{
-		return Error{ ErrorCode::IsDirectory, guest_path + " is a directory" };
-	}
-	if ((flags & kODirectory) != 0)
-	{
-		return Error{ ErrorCode::NotDirectory, guest_path + " is not a directory" };
-	}
-	auto opened = HostFile::open(guest_path, host.value().path);
-	if (!opened.ok())
-	{
-		return opened.error();
-	}
-	return std::unique_ptr<File>(std::move(opened.value()));
-}
-
 Result<uint64_t> VirtualFileSystem::open(uint64_t dirfd,
 	std::string_view path,
 	uint64_t flags,
@@ -421,77 +213,145 @@ Result<uint64_t> VirtualFileSystem::open(uint64_t dirfd,
 		return resolved.error();
 	}
 	const std::string &guest_path = resolved.value();
-
-	const uint64_t access = flags & kAccModeMask;
-	const bool writes = access != 0 || (flags & (kOCreate | kOTruncate | kOAppend)) != 0;
-
-	if (!writes)
+	auto mount = resolveMount(guest_path);
+	if (!mount.ok())
 	{
-		auto file = openPath(guest_path, flags);
-		if (!file.ok())
+		return mount.error();
+	}
+	auto file = mount.value().mount->backend->open(guest_path, mount.value().relative, flags, mode);
+	if (!file.ok())
+	{
+		// The backends answer EISDIR for a directory; a read-only open turns
+		// that into a snapshot descriptor. A write intent keeps the error.
+		if (file.error().code == ErrorCode::IsDirectory && !writesRequested(flags))
 		{
-			return file.error();
+			return openDirectory(guest_path, mount.value(), flags);
 		}
-		return fds_.insert(std::move(file.value()));
+		return file.error();
+	}
+	file.value()->setOpenFlags(flags);
+	if (mount.value().mount->synthetic_identity)
+	{
+		file.value()->setIdentity(
+			syntheticIdentity(mount.value().mount->id, guest_path));
+	}
+	return fds_.insert(std::move(file.value()));
+}
+
+Result<uint64_t> VirtualFileSystem::openDirectory(const std::string &guest_path,
+	const MountPoint &mount_point,
+	uint64_t flags)
+{
+	const Mount &mount = *mount_point.mount;
+	auto status = mount.backend->stat(guest_path, mount_point.relative);
+	if (!status.ok())
+	{
+		return status.error();
+	}
+	auto entries = mount.backend->readdir(guest_path, mount_point.relative);
+	if (!entries.ok())
+	{
+		return entries.error();
 	}
 
-	if (isProcPath(guest_path))
+	FileStat metadata = status.value();
+	VnodeIdentity self{ metadata.device, metadata.inode };
+	if (mount.synthetic_identity)
 	{
-		return Error{ ErrorCode::Unsupported, "proc files are read-only" };
+		self = syntheticIdentity(mount.id, guest_path);
+		metadata.device = self.device;
+		metadata.inode = self.inode;
 	}
-	if (auto node = findSynthetic(guest_path))
+
+	// Child mounts are visible in their parent's listing. The name belongs to
+	// the parent mount, but its identity belongs to the child mount.
+	for (const Mount &child_mount : mounts_->mounts())
 	{
-		if (node->create)
+		if (child_mount.prefix.empty())
 		{
-			// Character devices accept every access mode (O_CREAT/O_TRUNC are
-			// meaningless but legal, as on the kernel).
-			return fds_.insert(node->create(guest_path, flags));
+			continue;
 		}
-		// The property service is not modelled; like an app without write
-		// access to /dev/__properties__, the open fails.
-		return Error{ ErrorCode::Unsupported, guest_path + " is read-only" };
-	}
-	if ((flags & kODirectory) != 0)
-	{
-		return Error{ ErrorCode::NotDirectory, guest_path + " is not a directory" };
-	}
-	auto host_path = resolveWritePath(guest_path, (flags & kOCreate) != 0);
-	if (!host_path.ok())
-	{
-		return host_path.error();
-	}
-
-	int host_flags = (access == 2) ? O_RDWR : (access == 1 ? O_WRONLY : O_RDONLY);
-	if ((flags & kOCreate) != 0)
-	{
-		host_flags |= O_CREAT;
-	}
-	if ((flags & kOExclusive) != 0)
-	{
-		host_flags |= O_EXCL;
-	}
-	if ((flags & kOTruncate) != 0)
-	{
-		host_flags |= O_TRUNC;
-	}
-	if ((flags & kOAppend) != 0)
-	{
-		host_flags |= O_APPEND;
+		const size_t slash = child_mount.prefix.find_last_of('/');
+		const std::string parent = slash == 0 ? "/" : child_mount.prefix.substr(0, slash);
+		if (parent != guest_path)
+		{
+			continue;
+		}
+		const std::string name = child_mount.prefix.substr(slash + 1);
+		auto existing = std::find_if(entries.value().begin(), entries.value().end(),
+			[&name](const DirEntry &entry) { return entry.name == name; });
+		if (existing != entries.value().end())
+		{
+			existing->type = kDirTypeDirectory;
+			continue;
+		}
+		DirEntry entry;
+		entry.name = name;
+		entry.type = kDirTypeDirectory;
+		entries.value().push_back(std::move(entry));
 	}
 
-	auto opened = HostFile::openWritable(guest_path,
-		host_path.value(),
-		host_flags,
-		access,
-		(flags & kOAppend) != 0,
-		mode == 0 ? 0666 : mode);
-	if (!opened.ok())
+	// Every entry's inode comes from the mount that would answer a stat of
+	// that path, so getdents64 and fstatat always agree.
+	for (DirEntry &entry : entries.value())
 	{
-		// The only host-side failures that reach here are permission and
-		// missing-directory; the guest sees the correspondents.
-		return Error{ ErrorCode::PermissionDenied, "cannot open " + guest_path };
+		const std::string child_relative = mount_point.relative.empty() ?
+							 entry.name :
+							 mount_point.relative + "/" + entry.name;
+		const std::string child_guest = MountTable::join(mount.prefix, child_relative);
+		auto child = mounts_->resolve(child_guest);
+		if (child.ok() && child.value().mount->synthetic_identity)
+		{
+			entry.ino = syntheticIdentity(child.value().mount->id, child_guest).inode;
+		}
 	}
-	return fds_.insert(std::move(opened.value()));
+
+	std::string parent_guest = "/";
+	if (guest_path != "/")
+	{
+		const size_t slash = guest_path.find_last_of('/');
+		parent_guest = slash == 0 ? "/" : guest_path.substr(0, slash);
+	}
+	uint64_t parent_inode = self.inode;
+	if (parent_guest != guest_path)
+	{
+		auto parent = stat(static_cast<uint64_t>(kAtFdcwd), parent_guest);
+		if (parent.ok())
+		{
+			parent_inode = parent.value().inode;
+		}
+	}
+
+	std::vector<DirEntry> snapshot;
+	snapshot.reserve(entries.value().size() + 2);
+	snapshot.push_back(DirEntry{ ".", kDirTypeDirectory, self.inode });
+	snapshot.push_back(DirEntry{ "..", kDirTypeDirectory, parent_inode });
+	for (DirEntry &entry : entries.value())
+	{
+		snapshot.push_back(std::move(entry));
+	}
+
+	auto file = std::make_unique<DirFile>(guest_path, metadata, std::move(snapshot));
+	file->setOpenFlags(flags);
+	if (mount.synthetic_identity)
+	{
+		file->setIdentity(self);
+	}
+	return fds_.insert(std::move(file));
+}
+
+Result<void> VirtualFileSystem::close(uint64_t fd)
+{
+	std::shared_ptr<File> file = fds_.shared(fd);
+	if (!file)
+	{
+		return Error{ ErrorCode::BadFileDescriptor, "fd is not open" };
+	}
+	if (!file->closeable())
+	{
+		return {};
+	}
+	return fds_.remove(fd);
 }
 
 Result<void> VirtualFileSystem::mkdir(uint64_t dirfd, std::string_view path, uint64_t mode)
@@ -501,18 +361,12 @@ Result<void> VirtualFileSystem::mkdir(uint64_t dirfd, std::string_view path, uin
 	{
 		return resolved.error();
 	}
-	// The sandbox is a host directory tree, so creating one level needs the
-	// parent to exist; mkdirat(2) has the same rule.
-	auto host = resolveWritePath(resolved.value(), false);
-	if (!host.ok())
+	auto mount = resolveMount(resolved.value());
+	if (!mount.ok())
 	{
-		return host.error();
+		return mount.error();
 	}
-	if (::mkdir(host.value().c_str(), static_cast<mode_t>(mode == 0 ? 0777 : mode)) != 0)
-	{
-		return errnoToError(errno, "cannot create " + resolved.value());
-	}
-	return {};
+	return mount.value().mount->backend->mkdir(resolved.value(), mount.value().relative, mode);
 }
 
 Result<void> VirtualFileSystem::unlink(uint64_t dirfd,
@@ -524,28 +378,13 @@ Result<void> VirtualFileSystem::unlink(uint64_t dirfd,
 	{
 		return resolved.error();
 	}
-	auto host = resolveWritePath(resolved.value(), false);
-	if (!host.ok())
+	auto mount = resolveMount(resolved.value());
+	if (!mount.ok())
 	{
-		return host.error();
+		return mount.error();
 	}
-	std::error_code error;
-	const bool directory = std::filesystem::is_directory(host.value(), error);
-	if (!error && remove_directory && !directory)
-	{
-		return Error{ ErrorCode::NotDirectory, resolved.value() + " is not a directory" };
-	}
-	if (!error && !remove_directory && directory)
-	{
-		return Error{ ErrorCode::IsDirectory, resolved.value() + " is a directory" };
-	}
-	const int result = remove_directory ? ::rmdir(host.value().c_str()) :
-					      ::unlink(host.value().c_str());
-	if (result != 0)
-	{
-		return errnoToError(errno, "cannot remove " + resolved.value());
-	}
-	return {};
+	return mount.value().mount->backend->unlink(resolved.value(), mount.value().relative,
+		remove_directory);
 }
 
 Result<void> VirtualFileSystem::rename(uint64_t old_dirfd,
@@ -563,22 +402,23 @@ Result<void> VirtualFileSystem::rename(uint64_t old_dirfd,
 	{
 		return new_resolved.error();
 	}
-	auto old_host = resolveWritePath(old_resolved.value(), false);
-	if (!old_host.ok())
+	auto old_mount = resolveMount(old_resolved.value());
+	if (!old_mount.ok())
 	{
-		return old_host.error();
+		return old_mount.error();
 	}
-	auto new_host = resolveWritePath(new_resolved.value(), false);
-	if (!new_host.ok())
+	auto new_mount = resolveMount(new_resolved.value());
+	if (!new_mount.ok())
 	{
-		return new_host.error();
+		return new_mount.error();
 	}
-	if (::rename(old_host.value().c_str(), new_host.value().c_str()) != 0)
+	if (old_mount.value().mount != new_mount.value().mount)
 	{
-		return errnoToError(errno,
-			"cannot rename " + old_resolved.value() + " to " + new_resolved.value());
+		return Error{ ErrorCode::CrossDevice,
+			old_resolved.value() + " and " + new_resolved.value() + " are on different mounts" };
 	}
-	return {};
+	return old_mount.value().mount->backend->rename(old_resolved.value(),
+		old_mount.value().relative, new_resolved.value(), new_mount.value().relative);
 }
 
 Result<void> VirtualFileSystem::truncateFd(uint64_t fd, uint64_t size)
@@ -593,12 +433,6 @@ Result<void> VirtualFileSystem::truncateFd(uint64_t fd, uint64_t size)
 
 Result<void> VirtualFileSystem::syncFd(uint64_t fd)
 {
-	// Host stdio is shared with the runner; flushing it is harmless but not
-	// ours to report on.
-	if (fd <= 2)
-	{
-		return {};
-	}
 	std::shared_ptr<File> file = fds_.shared(fd);
 	if (!file)
 	{
@@ -796,66 +630,27 @@ Result<FileStat> VirtualFileSystem::stat(uint64_t dirfd, std::string_view path)
 		return resolved.error();
 	}
 	const std::string &guest_path = resolved.value();
-
-	if (isProcPath(guest_path))
+	auto mount = resolveMount(guest_path);
+	if (!mount.ok())
 	{
-		// Same precedence as openPath: the device snapshot answers when it has
-		// the file, the synthesizer otherwise.
-		const std::string lookup = hostLookupPath(guest_path, config_.pid);
-		auto host = resolveHost(lookup);
-		if (host.ok())
+		return mount.error();
+	}
+	auto stat = mount.value().mount->backend->stat(guest_path, mount.value().relative);
+	if (stat.ok())
+	{
+		if (mount.value().mount->synthetic_identity)
 		{
-			struct stat info = {};
-			if (::stat(host.value().path.c_str(), &info) != 0)
-			{
-				return Error{ ErrorCode::NotFound, "cannot stat " + guest_path };
-			}
-			FileStat result = toFileStat(info);
-			applyOwner(result);
-			return result;
+			const VnodeIdentity identity =
+				syntheticIdentity(mount.value().mount->id, guest_path);
+			stat.value().device = identity.device;
+			stat.value().inode = identity.inode;
 		}
-
-		auto generator = makeGenerator(guest_path, procContext());
-		if (!generator.has_value())
-		{
-			return Error{ ErrorCode::NotFound, "no such proc file: " + guest_path };
-		}
-		MemoryFile file(guest_path, std::move(generator.value()));
-		auto stat = file.stat();
-		if (stat.ok())
+		if (!mount.value().mount->backend->systemOwned())
 		{
 			applyOwner(stat.value());
 		}
-		return stat;
 	}
-
-	if (auto node = findSynthetic(guest_path))
-	{
-		FileStat result;
-		result.inode = std::hash<std::string>{}(guest_path);
-		result.mode = syntheticMode(*node);
-		result.rdev = node->rdev;
-		result.link_count = node->directory ? 2 : 1;
-		result.uid = 0;
-		result.gid = 0;
-		result.size = node->content ? node->content->size() : 0;
-		result.blocks = (result.size + 511) / 512;
-		return result;
-	}
-
-	auto host = resolveHost(guest_path);
-	if (!host.ok())
-	{
-		return host.error();
-	}
-	struct stat info = {};
-	if (::stat(host.value().path.c_str(), &info) != 0)
-	{
-		return Error{ ErrorCode::NotFound, "cannot stat " + guest_path };
-	}
-	FileStat result = toFileStat(info);
-	applyOwner(result);
-	return result;
+	return stat;
 }
 
 Result<FileStat> VirtualFileSystem::statFd(uint64_t fd)
@@ -866,24 +661,24 @@ Result<FileStat> VirtualFileSystem::statFd(uint64_t fd)
 		return Error{ ErrorCode::BadFileDescriptor, "fd is not open" };
 	}
 	auto stat = file->stat();
-	if (stat.ok() && !file->systemOwned())
+	if (stat.ok())
 	{
-		applyOwner(stat.value());
+		if (file->hasIdentity())
+		{
+			const VnodeIdentity identity = file->identity();
+			stat.value().device = identity.device;
+			stat.value().inode = identity.inode;
+		}
+		if (!file->systemOwned())
+		{
+			applyOwner(stat.value());
+		}
 	}
 	return stat;
 }
 
 Result<std::shared_ptr<File> > VirtualFileSystem::describe(uint64_t fd)
 {
-	if (fd <= 2)
-	{
-		std::shared_ptr<StdioFile> &slot = stdio_[fd];
-		if (!slot)
-		{
-			slot = std::make_shared<StdioFile>(static_cast<int>(fd));
-		}
-		return std::static_pointer_cast<File>(slot);
-	}
 	std::shared_ptr<File> file = fds_.shared(fd);
 	if (!file)
 	{
@@ -951,10 +746,6 @@ Result<void> VirtualFileSystem::duplicateTo(uint64_t fd, uint64_t target)
 		}
 		return {};
 	}
-	if (target <= 2)
-	{
-		return Error{ ErrorCode::BadFileDescriptor, "stdin/stdout/stderr are fixed" };
-	}
 	auto file = describe(fd);
 	if (!file.ok())
 	{
@@ -970,78 +761,12 @@ Result<void> VirtualFileSystem::access(uint64_t dirfd, std::string_view path, ui
 	{
 		return resolved.error();
 	}
-	const std::string &guest_path = resolved.value();
-
-	if (auto node = findSynthetic(guest_path))
+	auto mount = resolveMount(resolved.value());
+	if (!mount.ok())
 	{
-		// Synthetic nodes are root-owned with the same bits for every class,
-		// so the "other" permission bits are what an unprivileged guest sees.
-		const uint32_t permissions = syntheticMode(*node) & 0777;
-		if ((mode & kAccessRead) != 0 && (permissions & 0444) == 0)
-		{
-			return Error{ ErrorCode::PermissionDenied, guest_path + " is not readable" };
-		}
-		if ((mode & kAccessWrite) != 0 && (permissions & 0222) == 0)
-		{
-			return Error{ ErrorCode::PermissionDenied, guest_path + " is read-only" };
-		}
-		if ((mode & kAccessExecute) != 0 && (permissions & 0111) == 0)
-		{
-			return Error{ ErrorCode::PermissionDenied, guest_path + " is not executable" };
-		}
-		return {};
+		return mount.error();
 	}
-
-	if (isProcPath(guest_path))
-	{
-		const std::string lookup = hostLookupPath(guest_path, config_.pid);
-		auto host = resolveHost(lookup);
-		if (host.ok())
-		{
-			if ((mode & kAccessRead) != 0 &&
-				::access(host.value().path.c_str(), R_OK) != 0)
-			{
-				return Error{ ErrorCode::PermissionDenied, "cannot read " + guest_path };
-			}
-		}
-		else if (!makeGenerator(guest_path, procContext()).has_value())
-		{
-			return Error{ ErrorCode::NotFound, "no such proc file: " + guest_path };
-		}
-	}
-	else
-	{
-		auto host = resolveHost(guest_path);
-		if (!host.ok())
-		{
-			return host.error();
-		}
-		if ((mode & kAccessRead) != 0 && ::access(host.value().path.c_str(), R_OK) != 0)
-		{
-			return Error{ ErrorCode::PermissionDenied, "cannot read " + guest_path };
-		}
-	}
-
-	if ((mode & kAccessWrite) != 0)
-	{
-		// W_OK only holds inside the writable sandbox: the read-only roots may
-		// be host-writable, but the guest must not see that.
-		auto write_path = resolveWritePath(guest_path, false);
-		if (!write_path.ok())
-		{
-			return Error{ ErrorCode::PermissionDenied, guest_path + " is read-only" };
-		}
-		if (::access(write_path.value().c_str(), W_OK) != 0)
-		{
-			return Error{ ErrorCode::PermissionDenied, "cannot write " + guest_path };
-		}
-	}
-	if ((mode & kAccessExecute) != 0)
-	{
-		// Execution is decided by the mapping permissions, not by access(2).
-		return Error{ ErrorCode::PermissionDenied, "execute access is not modelled" };
-	}
-	return {};
+	return mount.value().mount->backend->access(resolved.value(), mount.value().relative, mode);
 }
 
 } // namespace duckemu::runtime::vfs

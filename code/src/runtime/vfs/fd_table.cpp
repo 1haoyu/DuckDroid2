@@ -28,16 +28,17 @@ Result<uint64_t> FdTable::insertShared(std::shared_ptr<File> file, uint64_t mini
 
 Result<void> FdTable::assign(uint64_t fd, std::shared_ptr<File> file)
 {
-	if (fd < kFirstGuestFd)
-	{
-		return Error{ ErrorCode::BadFileDescriptor, "descriptor is host stdio" };
-	}
 	if (!file)
 	{
 		return Error{ ErrorCode::InvalidArgument, "no file description" };
 	}
 	files_[fd] = std::move(file);
 	return {};
+}
+
+Result<void> FdTable::install(uint64_t fd, std::shared_ptr<File> file)
+{
+	return assign(fd, std::move(file));
 }
 
 File *FdTable::find(uint64_t fd) const

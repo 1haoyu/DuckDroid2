@@ -10,12 +10,11 @@
 #include <vector>
 
 #include <sys/stat.h>
-#include <unistd.h>
 
-#include "common/log/logger.hpp"
 #include "runtime/memory/address_space.hpp"
 #include "runtime/svc/handler.hpp"
 #include "runtime/svc/syscall_numbers.hpp"
+#include "runtime/vfs/dir_file.hpp"
 #include "runtime/vfs/file.hpp"
 #include "runtime/vfs/virtual_file_system.hpp"
 
@@ -57,8 +56,6 @@ constexpr size_t kStatfsNameLengthOffset = 64;
 constexpr size_t kStatfsFragmentSizeOffset = 72;
 constexpr size_t kStatfsFlagsOffset = 80;
 
-constexpr uint32_t kModeCharacter = 0020000;
-
 // fcntl commands and arm64 flag values bionic may pass.
 constexpr int64_t kFcntlDupFd = 0;
 constexpr int64_t kFcntlGetFd = 1;
@@ -70,7 +67,6 @@ constexpr int64_t kFcntlSetLk = 6;
 constexpr int64_t kFcntlSetLkW = 7;
 constexpr int64_t kFcntlDupFdCloexec = 1030;
 constexpr uint64_t kOFdCloexec = 0x80000;
-constexpr uint64_t kOWrOnly = 1;
 // struct flock on arm64: l_type(2) l_whence(2) l_start(8) l_len(8) l_pid(4)
 // plus padding. F_UNLCK == 2; F_RDLCK is 0, so a zeroed struct would claim a
 // read lock.
@@ -127,7 +123,10 @@ int64_t toErrno(const Error &error)
 	case ErrorCode::AlreadyExists:
 		return kError(kEexist);
 	case ErrorCode::Unsupported:
+	case ErrorCode::ReadOnly:
 		return kError(kErofs);
+	case ErrorCode::CrossDevice:
+		return kError(kExdev);
 	case ErrorCode::BadFileDescriptor:
 		return kError(kEbadf);
 	case ErrorCode::IsDirectory:
@@ -234,20 +233,12 @@ int64_t sysStatfs(SyscallContext &ctx)
 
 int64_t sysFstatfs(SyscallContext &ctx)
 {
-	const uint64_t fd = ctx.args[0];
-	vfs::FileSystemStats stats;
-	if (fd <= 2) {
-		// The standard streams are the host's; describe them as a tmpfs.
-		stats = ctx.vfs.fileSystemForPath("/dev/stdout");
+	auto result = ctx.vfs.statfsFd(ctx.args[0]);
+	if (!result.ok())
+	{
+		return toErrno(result.error());
 	}
-	else {
-		auto result = ctx.vfs.statfsFd(fd);
-		if (!result.ok()) {
-			return toErrno(result.error());
-		}
-		stats = result.value();
-	}
-	return writeStatfs(ctx, ctx.args[1], stats);
+	return writeStatfs(ctx, ctx.args[1], result.value());
 }
 
 int64_t sysReadlinkat(SyscallContext &ctx)
@@ -293,15 +284,6 @@ int64_t sysWrite(SyscallContext &ctx)
 		return kError(kEfault);
 	}
 
-	if (fd == 1 || fd == 2) {
-		const ssize_t written = ::write(static_cast<int>(fd), buffer.data(), buffer.size());
-		if (written < 0) {
-			DUCKEMU_WARN("host write(fd=%llu) failed", static_cast<unsigned long long>(fd));
-			return kError(kEio);
-		}
-		return static_cast<int64_t>(written);
-	}
-
 	vfs::File *file = ctx.vfs.find(fd);
 	if (file == nullptr || !file->writable()) {
 		return kError(kEbadf);
@@ -327,23 +309,6 @@ int64_t sysRead(SyscallContext &ctx)
 
 	if (count > kMaxIoBytes) {
 		return kError(kEinval);
-	}
-
-	if (fd <= 2) {
-		if (fd != 0) {
-			return kError(kEbadf);
-		}
-		std::vector<uint8_t> buffer(static_cast<size_t>(count));
-		const ssize_t received = ::read(0, buffer.data(), buffer.size());
-		if (received < 0) {
-			return kError(kEio);
-		}
-		auto copied = ctx.memory.write(GuestVA{ buffer_address }, buffer.data(),
-			static_cast<uint64_t>(received));
-		if (!copied.ok()) {
-			return kError(kEfault);
-		}
-		return static_cast<int64_t>(received);
 	}
 
 	vfs::File *file = ctx.vfs.find(fd);
@@ -374,9 +339,6 @@ int64_t sysPread64(SyscallContext &ctx)
 	const uint64_t count = ctx.args[2];
 	const uint64_t offset = ctx.args[3];
 
-	if (fd <= 2) {
-		return kError(kEspipe);
-	}
 	if (count > kMaxIoBytes) {
 		return kError(kEinval);
 	}
@@ -399,13 +361,79 @@ int64_t sysPread64(SyscallContext &ctx)
 	return static_cast<int64_t>(read.value());
 }
 
+int64_t sysPwrite64(SyscallContext &ctx)
+{
+	const uint64_t fd = ctx.args[0];
+	const uint64_t buffer_address = ctx.args[1];
+	const uint64_t count = ctx.args[2];
+	const uint64_t offset = ctx.args[3];
+
+	if (count > kMaxIoBytes) {
+		return kError(kEinval);
+	}
+	vfs::File *file = ctx.vfs.find(fd);
+	if (file == nullptr) {
+		return kError(kEbadf);
+	}
+	std::vector<uint8_t> buffer(static_cast<size_t>(count));
+	auto copied = ctx.memory.read(GuestVA{ buffer_address }, buffer.data(), count);
+	if (!copied.ok()) {
+		return kError(kEfault);
+	}
+	auto written = file->writeAt(offset, buffer.data(), count);
+	const int64_t write_result =
+		written.ok() ? static_cast<int64_t>(written.value()) : toErrno(written.error());
+	traceIo("pwrite", fd, file->path().data(), count, write_result);
+	if (!written.ok())
+	{
+		return write_result;
+	}
+	ctx.vfs.notifyActivity();
+	return static_cast<int64_t>(written.value());
+}
+
+int64_t sysGetdents64(SyscallContext &ctx)
+{
+	const uint64_t fd = ctx.args[0];
+	const uint64_t buffer_address = ctx.args[1];
+	const uint64_t count = ctx.args[2];
+	if (count > kMaxIoBytes)
+	{
+		return kError(kEinval);
+	}
+	vfs::File *file = ctx.vfs.find(fd);
+	if (file == nullptr)
+	{
+		return kError(kEbadf);
+	}
+	if (file->kind() != vfs::FileKind::Directory)
+	{
+		return kError(kEnotdir);
+	}
+	std::vector<uint8_t> records(static_cast<size_t>(count));
+	auto written = static_cast<vfs::DirFile *>(file)->readEntries(records.data(), count);
+	const int64_t result =
+		written.ok() ? static_cast<int64_t>(written.value()) : toErrno(written.error());
+	traceIo("getdents", fd, file->path().data(), count, result);
+	if (!written.ok())
+	{
+		return result;
+	}
+	if (written.value() == 0)
+	{
+		return 0;
+	}
+	auto copied = ctx.memory.write(GuestVA{ buffer_address }, records.data(), written.value());
+	if (!copied.ok())
+	{
+		return kError(kEfault);
+	}
+	return static_cast<int64_t>(written.value());
+}
+
 int64_t sysClose(SyscallContext &ctx)
 {
 	const uint64_t fd = ctx.args[0];
-	// Do not close the host's stdio out from under the tests.
-	if (fd <= 2) {
-		return 0;
-	}
 	// close() destroys the description, so keep the path alive for the trace.
 	const std::string path = filePathOrDash(ctx.vfs, fd);
 	auto closed = ctx.vfs.close(fd);
@@ -416,9 +444,6 @@ int64_t sysClose(SyscallContext &ctx)
 int64_t sysLseek(SyscallContext &ctx)
 {
 	const uint64_t fd = ctx.args[0];
-	if (fd <= 2) {
-		return kError(kEspipe);
-	}
 	vfs::File *file = ctx.vfs.find(fd);
 	if (file == nullptr) {
 		return kError(kEbadf);
@@ -465,6 +490,30 @@ int64_t sysUnlinkat(SyscallContext &ctx)
 
 int64_t sysRenameat(SyscallContext &ctx)
 {
+	std::string old_path;
+	std::string new_path;
+	int64_t path_error = readPath(ctx, ctx.args[1], old_path);
+	if (path_error != 0)
+	{
+		return path_error;
+	}
+	path_error = readPath(ctx, ctx.args[3], new_path);
+	if (path_error != 0)
+	{
+		return path_error;
+	}
+	auto renamed = ctx.vfs.rename(ctx.args[0], old_path, ctx.args[2], new_path);
+	return renamed.ok() ? 0 : toErrno(renamed.error());
+}
+
+// renameat2(276). bionic's rename(3) goes through this on modern ROMs; only
+// the flagless form is modelled (no RENAME_NOREPLACE/EXCHANGE/WHITEOUT).
+int64_t sysRenameat2(SyscallContext &ctx)
+{
+	if (ctx.args[4] != 0)
+	{
+		return kError(kEinval);
+	}
 	std::string old_path;
 	std::string new_path;
 	int64_t path_error = readPath(ctx, ctx.args[1], old_path);
@@ -532,16 +581,11 @@ int64_t sysNewfstatat(SyscallContext &ctx)
 	vfs::FileStat stat;
 	if (path.empty() && (flags & kAtEmptyPath) != 0) {
 		// fstatat(fd, "", &st, AT_EMPTY_PATH) is how bionic implements fstat.
-		if (dirfd <= 2) {
-			stat.mode = kModeCharacter | 0666;
+		auto result = ctx.vfs.statFd(dirfd);
+		if (!result.ok()) {
+			return toErrno(result.error());
 		}
-		else {
-			auto result = ctx.vfs.statFd(dirfd);
-			if (!result.ok()) {
-				return toErrno(result.error());
-			}
-			stat = result.value();
-		}
+		stat = result.value();
 	}
 	else if (path.empty()) {
 		return kError(kEnoent);
@@ -593,7 +637,7 @@ int64_t sysDup3(SyscallContext &ctx)
 
 bool fdIsOpen(SyscallContext &ctx, uint64_t fd)
 {
-	return fd <= 2 || ctx.vfs.find(fd) != nullptr;
+	return ctx.vfs.find(fd) != nullptr;
 }
 
 // No descriptor kind models ioctls (route item #8), so the answer is the one
@@ -627,18 +671,13 @@ int64_t sysFcntl(SyscallContext &ctx)
 		return fdIsOpen(ctx, fd) ? 0 : kError(kEbadf);
 	case kFcntlGetFl:
 	{
-		if (fd <= 2)
-		{
-			return fd == 0 ? 0 : static_cast<int64_t>(kOWrOnly);
-		}
 		vfs::File *file = ctx.vfs.find(fd);
 		if (file == nullptr)
 		{
 			return kError(kEbadf);
 		}
-		// openat only admits read-only opens, so the access mode is derived
-		// from the description.
-		return file->writable() ? static_cast<int64_t>(kOWrOnly) : 0;
+		// The description remembers the access mode and O_APPEND.
+		return static_cast<int64_t>(file->openFlags());
 	}
 	case kFcntlSetFl:
 		// O_NONBLOCK and friends are not stored on the description; a guest
@@ -673,19 +712,12 @@ int64_t sysFcntl(SyscallContext &ctx)
 
 int64_t sysFstat(SyscallContext &ctx)
 {
-	const uint64_t fd = ctx.args[0];
-	vfs::FileStat stat;
-	if (fd <= 2) {
-		stat.mode = kModeCharacter | 0666;
+	auto result = ctx.vfs.statFd(ctx.args[0]);
+	if (!result.ok())
+	{
+		return toErrno(result.error());
 	}
-	else {
-		auto result = ctx.vfs.statFd(fd);
-		if (!result.ok()) {
-			return toErrno(result.error());
-		}
-		stat = result.value();
-	}
-	return writeStat(ctx, ctx.args[1], stat);
+	return writeStat(ctx, ctx.args[1], result.value());
 }
 
 } // namespace
@@ -703,6 +735,10 @@ std::optional<int64_t> handleFsSyscall(SyscallContext &ctx, uint32_t number)
 		return sysWrite(ctx);
 	case kSysPread64:
 		return sysPread64(ctx);
+	case kSysPwrite64:
+		return sysPwrite64(ctx);
+	case kSysGetdents64:
+		return sysGetdents64(ctx);
 	case kSysLseek:
 		return sysLseek(ctx);
 	case kSysStatfs:
@@ -732,6 +768,8 @@ std::optional<int64_t> handleFsSyscall(SyscallContext &ctx, uint32_t number)
 		return sysUnlinkat(ctx);
 	case kSysRenameat:
 		return sysRenameat(ctx);
+	case kSysRenameat2:
+		return sysRenameat2(ctx);
 	case kSysFtruncate:
 		return sysFtruncate(ctx);
 	case kSysFsync:

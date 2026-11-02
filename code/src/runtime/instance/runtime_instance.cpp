@@ -692,7 +692,10 @@ Result<std::unique_ptr<RuntimeInstance> > RuntimeInstance::create(const RuntimeC
 	vfs_config.uid = config.device.uid;
 	vfs_config.gid = config.device.gid;
 	vfs_config.device = &config.device;
-	vfs_config.synthetic_mounts = { impl->dev.get(), impl->properties.get() };
+	vfs_config.synthetic_mounts = {
+		{ "/dev", impl->dev.get() },
+		{ "/dev/__properties__", impl->properties.get() },
+	};
 	// Injected wall time also stamps file metadata, so a replay sees the same
 	// stat(2) results.
 	vfs_config.clock = &impl->clock;

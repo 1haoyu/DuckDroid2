@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +15,7 @@
 #include "common/id/ids.hpp"
 #include "runtime/vfs/fd_table.hpp"
 #include "runtime/vfs/file.hpp"
+#include "runtime/vfs/mount_table.hpp"
 #include "runtime/vfs/proc_fs.hpp"
 #include "runtime/vfs/synthetic_file_system.hpp"
 
@@ -31,6 +31,12 @@ struct DeviceProfile;
 
 namespace duckemu::runtime::vfs
 {
+
+class HostRoFs;
+class OverlayFs;
+class ProcFs;
+class SandboxFs;
+class SyntheticMountFs;
 
 // statfs(2) view of one mount (arm64 `struct statfs`, all 64-bit words).
 struct FileSystemStats
@@ -50,6 +56,13 @@ struct FileSystemStats
 
 // ST_RDONLY in f_flags.
 inline constexpr uint64_t kMountReadOnly = 0x1;
+
+// One fixed synthetic namespace to mount (/dev, /dev/__properties__).
+struct SyntheticMountConfig
+{
+	std::string prefix;
+	const SyntheticFileSystem *files = nullptr;
+};
 
 struct VfsConfig
 {
@@ -78,18 +91,21 @@ struct VfsConfig
 	const device::DeviceProfile *device = nullptr;
 
 	// Synthetic mounts outside the host roots (/dev, /dev/__properties__).
-	// Owners outlive the VFS; later entries win on overlap.
-	std::vector<const SyntheticFileSystem *> synthetic_mounts;
+	// The namespaces outlive the VFS. Later entries win on overlap.
+	std::vector<SyntheticMountConfig> synthetic_mounts;
 };
 
 // The process-level file system seen by guest syscalls: a descriptor table
-// plus the path namespace (/proc/self generated on demand, host roots mounted
-// read-only). Not thread-safe by itself; every access happens on the single
-// guest CPU under the scheduler's execution lock.
+// plus the path namespace. The namespace is a fixed mount table
+// ([/] OverlayFs, /proc ProcFs, /dev and /dev/__properties__ synthetic); each
+// mount owns its own precedence rules. Not thread-safe by itself; every
+// access happens on the single guest CPU under the scheduler's execution
+// lock.
 class VirtualFileSystem
 {
     public:
 	VirtualFileSystem(RuntimeMemory &memory, VfsConfig config);
+	~VirtualFileSystem();
 
 	VirtualFileSystem(const VirtualFileSystem &) = delete;
 	VirtualFileSystem &operator=(const VirtualFileSystem &) = delete;
@@ -115,8 +131,9 @@ class VirtualFileSystem
 		uint64_t flags,
 		uint64_t mode = 0666);
 
-	// unlinkat(2)/renameat(2). Both only reach inside the writable sandbox;
-	// a path that exists solely under a read-only root answers EROFS.
+	// unlinkat(2)/renameat(2). Both only reach the writable layer; a path
+	// that exists solely under a read-only root answers EROFS, and a rename
+	// between mounts answers EXDEV.
 	Result<void> mkdir(uint64_t dirfd, std::string_view path, uint64_t mode);
 	Result<void> unlink(uint64_t dirfd, std::string_view path, bool remove_directory);
 	Result<void> rename(uint64_t old_dirfd,
@@ -130,7 +147,7 @@ class VirtualFileSystem
 	// newfstatat(2) with a path. AT_EMPTY_PATH is handled by the caller.
 	[[nodiscard]] Result<FileStat> stat(uint64_t dirfd, std::string_view path);
 	[[nodiscard]] Result<FileStat> statFd(uint64_t fd);
-	// faccessat(2). W_OK/X_OK are refused: the mounted roots are read-only.
+	// faccessat(2). W_OK only holds inside the writable layer.
 	Result<void> access(uint64_t dirfd, std::string_view path, uint64_t mode);
 
 	// readlinkat(2). Only /proc/self magic links are modelled (exe, cwd, root,
@@ -150,10 +167,9 @@ class VirtualFileSystem
 	{
 		return fds_.find(fd);
 	}
-	Result<void> close(uint64_t fd)
-	{
-		return fds_.remove(fd);
-	}
+	// close(2). The permanently installed standard descriptors answer success
+	// without being discarded.
+	Result<void> close(uint64_t fd);
 
 	// Inserts an already-built description (eventfd/timerfd/epoll instances).
 	[[nodiscard]] Result<uint64_t> add(std::unique_ptr<File> file)
@@ -170,30 +186,23 @@ class VirtualFileSystem
 	void notifyActivity();
 
 	// dup(2) / F_DUPFD: lowest free descriptor >= `minimum` for the same open
-	// file description. Standard streams are materialized on demand, so
-	// dup(1) yields a descriptor whose write() still reaches the host.
+	// file description. The standard streams live in the table, so dup(1)
+	// shares the host stdout description.
 	[[nodiscard]] Result<uint64_t> duplicate(uint64_t fd,
 		uint64_t minimum = FdTable::kFirstGuestFd);
-	// dup2(2)/dup3(2) onto an exact descriptor. Replacing 0/1/2 is refused:
-	// they are the host's, and the syscall handlers address them by number.
+	// dup2(2)/dup3(2) onto an exact descriptor, including 0/1/2.
 	[[nodiscard]] Result<void> duplicateTo(uint64_t fd, uint64_t target);
 
 	[[nodiscard]] const VfsConfig &config() const
 	{
 		return config_;
 	}
+	[[nodiscard]] const MountTable &mounts() const
+	{
+		return *mounts_;
+	}
 
     private:
-	struct HostPath
-	{
-		std::string path;
-		bool directory = false;
-	};
-
-	// Host path of `guest_path` inside the writable sandbox. Canonicalises the
-	// parent (never the leaf, which may not exist yet) and refuses escapes.
-	[[nodiscard]] Result<std::string> resolveWritePath(const std::string &guest_path,
-		bool create_parents) const;
 	// Stamps the configured owner and, when wall time is injected, the
 	// replayed timestamps onto a stat result.
 	void applyOwner(FileStat &stat) const;
@@ -201,13 +210,11 @@ class VirtualFileSystem
 	// StdioFile so repeated dups share it.
 	[[nodiscard]] Result<std::shared_ptr<File> > describe(uint64_t fd);
 	[[nodiscard]] Result<std::string> resolvePath(uint64_t dirfd, std::string_view path) const;
-	[[nodiscard]] Result<HostPath> resolveHost(const std::string &guest_path) const;
-	[[nodiscard]] Result<std::unique_ptr<File> > openPath(const std::string &guest_path,
-		uint64_t flags) const;
-	// First synthetic mount that answers for this path (later mounts win).
-	[[nodiscard]] std::optional<SyntheticNode> findSynthetic(std::string_view guest_path) const;
-	// Effective guest mode of a synthetic node.
-	[[nodiscard]] static uint32_t syntheticMode(const SyntheticNode &node);
+	[[nodiscard]] Result<MountPoint> resolveMount(const std::string &guest_path) const;
+	// Snapshot the directory and install a DirFile descriptor.
+	[[nodiscard]] Result<uint64_t> openDirectory(const std::string &guest_path,
+		const MountPoint &mount_point,
+		uint64_t flags);
 	// readlink target of an open descriptor (/proc/self/fd/N).
 	[[nodiscard]] Result<std::string> fileLink(File &file);
 	[[nodiscard]] ProcContext procContext() const;
@@ -215,7 +222,13 @@ class VirtualFileSystem
 	RuntimeMemory &memory_;
 	VfsConfig config_;
 	FdTable fds_;
-	std::array<std::shared_ptr<StdioFile>, 3> stdio_;
+
+	std::vector<std::unique_ptr<HostRoFs> > host_roots_;
+	std::unique_ptr<SandboxFs> sandbox_;
+	std::unique_ptr<OverlayFs> overlay_;
+	std::unique_ptr<ProcFs> proc_;
+	std::vector<std::unique_ptr<SyntheticMountFs> > synthetic_;
+	std::unique_ptr<MountTable> mounts_;
 
 	// Guarded: notifyActivity runs on the writing guest thread while a waiter
 	// may be registering or being destroyed on its own thread.
