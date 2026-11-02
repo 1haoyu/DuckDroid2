@@ -250,19 +250,45 @@ Result<uint64_t> JniState::ensureEnvSlot(uint64_t thread_key)
 	{
 		return found->second;
 	}
-	auto cell = world_->arena().allocate(sizeof(uint64_t), 8);
-	if (!cell.ok())
+	uint64_t cell = 0;
+	if (!free_env_slots_.empty())
 	{
-		return cell.error();
+		cell = free_env_slots_.back();
+		free_env_slots_.pop_back();
+	}
+	else
+	{
+		auto allocated = world_->arena().allocate(sizeof(uint64_t), 8);
+		if (!allocated.ok())
+		{
+			return allocated.error();
+		}
+		cell = allocated.value();
 	}
 	const uint64_t table = env_table_.value();
-	auto written = memory_.write(GuestVA{ cell.value() }, &table, sizeof(table));
+	auto written = memory_.write(GuestVA{ cell }, &table, sizeof(table));
 	if (!written.ok())
 	{
+		free_env_slots_.push_back(cell);
 		return written.error();
 	}
-	env_slots_[thread_key] = cell.value();
-	return cell.value();
+	env_slots_[thread_key] = cell;
+	return cell;
+}
+
+void JniState::releaseThread(uint64_t thread_key)
+{
+	refs_.releaseThread(thread_key);
+
+	const auto found = env_slots_.find(thread_key);
+	if (found == env_slots_.end())
+	{
+		return;
+	}
+	const uint64_t zero = 0;
+	(void)memory_.write(GuestVA{ found->second }, &zero, sizeof(zero));
+	free_env_slots_.push_back(found->second);
+	env_slots_.erase(found);
 }
 
 Result<uint64_t> JniState::newLocal(uint64_t thread_key, uint64_t object)
@@ -427,8 +453,16 @@ int64_t JniState::invokeEnv(uint32_t slot, HostCallArgs &args)
 		return world_->pendingException() != 0 ? 1 : 0;
 
 	case JniSlotPushLocalFrame:
+	{
+		const int32_t capacity = static_cast<int32_t>(args.x[1]);
+		if (capacity < 0 || !refs_.ensureLocalCapacity(thread_key, static_cast<size_t>(capacity)))
+		{
+			DUCKEMU_WARN("jni: PushLocalFrame cannot reserve %d local references", capacity);
+			return kJniErr;
+		}
 		refs_.pushFrame(thread_key);
 		return kJniOk;
+	}
 
 	case JniSlotPopLocalFrame:
 	{
@@ -443,11 +477,31 @@ int64_t JniState::invokeEnv(uint32_t slot, HostCallArgs &args)
 	}
 
 	case JniSlotDeleteGlobalRef:
-		refs_.deleteGlobal(args.x[1]);
+		if (!refs_.deleteGlobal(args.x[1]))
+		{
+			DUCKEMU_WARN("jni: DeleteGlobalRef on a handle that is not a live global reference");
+		}
+		return 0;
+
+	case JniSlotNewWeakGlobalRef:
+	{
+		auto handle = refs_.newWeakGlobal(refs_.resolve(args.x[1]));
+		return handle.ok() ? static_cast<int64_t>(handle.value()) : 0;
+	}
+
+	case JniSlotDeleteWeakGlobalRef:
+		if (!refs_.deleteWeakGlobal(args.x[1]))
+		{
+			DUCKEMU_WARN("jni: DeleteWeakGlobalRef on a handle that is not a live weak reference");
+		}
 		return 0;
 
 	case JniSlotDeleteLocalRef:
-		refs_.deleteLocal(thread_key, args.x[1]);
+		if (!refs_.deleteLocal(thread_key, args.x[1]))
+		{
+			DUCKEMU_WARN("jni: DeleteLocalRef(0x%llx) is not a live reference of this thread",
+				static_cast<unsigned long long>(args.x[1]));
+		}
 		return 0;
 
 	case JniSlotIsSameObject:
@@ -460,7 +514,15 @@ int64_t JniState::invokeEnv(uint32_t slot, HostCallArgs &args)
 		return static_cast<int64_t>(refs_.typeOf(args.x[1]));
 
 	case JniSlotEnsureLocalCapacity:
+	{
+		const int32_t capacity = static_cast<int32_t>(args.x[1]);
+		if (capacity < 0 || !refs_.ensureLocalCapacity(thread_key, static_cast<size_t>(capacity)))
+		{
+			DUCKEMU_WARN("jni: EnsureLocalCapacity(%d) cannot be satisfied", capacity);
+			return kJniErr;
+		}
 		return kJniOk;
+	}
 
 	case JniSlotAllocObject:
 	{
@@ -1097,6 +1159,10 @@ int64_t JniState::invokeVm(uint32_t slot, HostCallArgs &args)
 	}
 
 	case JvmSlotDetachCurrentThread:
+		// The guest thread leaves the JNI world: drop its local references and
+		// its JNIEnv slot. The guest thread itself keeps running (the scheduler
+		// owns its lifetime), and AttachCurrentThread can create a new env.
+		releaseThread(args.thread_pointer);
 		return kJniOk;
 
 	case JvmSlotDestroyJavaVM:
@@ -1124,6 +1190,7 @@ Result<uint64_t> JniState::callRegisteredNative(threads::ThreadScheduler &schedu
 	uint64_t native_address = 0;
 	uint64_t jclass = 0;
 	uint64_t env = 0;
+	uint64_t thread_key = 0;
 	std::array<uint64_t, 8> call_args{};
 	{
 		// Resolving and allocating handles writes guest memory; keep it
@@ -1147,20 +1214,24 @@ Result<uint64_t> JniState::callRegisteredNative(threads::ThreadScheduler &schedu
 				"native method " + std::string(name) + std::string(signature) + " is not registered" };
 		}
 		native_address = record->native_address;
+		// The native runs on the scheduler's main guest thread, so its JNI
+		// calls are keyed by that thread's TPIDR_EL0. The frame must use the
+		// same key or pop would leave every reference it created behind.
+		thread_key = scheduler.mainThreadPointer();
 		// Everything this call creates belongs to a local frame; only an object
 		// result is promoted back to the caller's frame.
-		refs_.pushFrame(0);
-		auto class_handle = refs_.newLocal(0, klass);
+		refs_.pushFrame(thread_key);
+		auto class_handle = refs_.newLocal(thread_key, klass);
 		if (!class_handle.ok())
 		{
-			refs_.popFrame(0, 0);
+			refs_.popFrame(thread_key, 0);
 			return class_handle.error();
 		}
 		jclass = class_handle.value();
-		auto env_slot = ensureEnvSlot(0);
+		auto env_slot = ensureEnvSlot(thread_key);
 		if (!env_slot.ok())
 		{
-			refs_.popFrame(0, 0);
+			refs_.popFrame(thread_key, 0);
 			return env_slot.error();
 		}
 		env = env_slot.value();
@@ -1172,10 +1243,10 @@ Result<uint64_t> JniState::callRegisteredNative(threads::ThreadScheduler &schedu
 			uint64_t value = args[index];
 			if (index < parsed.args.size() && parsed.args[index] == ValueKind::Object && value != 0)
 			{
-				auto handle = refs_.newLocal(0, value);
+				auto handle = refs_.newLocal(thread_key, value);
 				if (!handle.ok())
 				{
-					refs_.popFrame(0, 0);
+					refs_.popFrame(thread_key, 0);
 					return handle.error();
 				}
 				value = handle.value();
@@ -1190,18 +1261,18 @@ Result<uint64_t> JniState::callRegisteredNative(threads::ThreadScheduler &schedu
 		auto execution = scheduler.lockExecution();
 		if (!called.ok())
 		{
-			refs_.popFrame(0, 0);
+			refs_.popFrame(thread_key, 0);
 			return called.error();
 		}
 		if (called.value().exit_code.has_value())
 		{
-			refs_.popFrame(0, 0);
+			refs_.popFrame(thread_key, 0);
 			return Error{ ErrorCode::Unsupported, "a registered native called exit_group" };
 		}
 		returned = called.value().return_value;
 		if (parsed.result == ValueKind::Object && returned != 0)
 		{
-			auto promoted = refs_.popFrame(0, returned);
+			auto promoted = refs_.popFrame(thread_key, returned);
 			if (!promoted.ok())
 			{
 				return promoted.error();
@@ -1210,7 +1281,7 @@ Result<uint64_t> JniState::callRegisteredNative(threads::ThreadScheduler &schedu
 		}
 		else
 		{
-			refs_.popFrame(0, 0);
+			refs_.popFrame(thread_key, 0);
 		}
 	}
 	return returned;

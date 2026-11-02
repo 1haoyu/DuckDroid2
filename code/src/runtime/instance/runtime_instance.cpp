@@ -750,6 +750,13 @@ Result<std::unique_ptr<RuntimeInstance> > RuntimeInstance::create(const RuntimeC
 	scheduler_config.clock = &impl->clock;
 	scheduler_config.device = &config.device;
 	scheduler_config.random = impl->random.get();
+	// Thread-scoped JNI state (local references, JNIEnv slot) is released when
+	// the scheduler reaps the guest thread. The scheduler is destroyed before
+	// the JNI layer, so the raw pointer stays valid for every hook call.
+	jni::JniState *jni_for_threads = impl->jni.get();
+	scheduler_config.thread_exit = [jni_for_threads](uint64_t thread_key) {
+		jni_for_threads->releaseThread(thread_key);
+	};
 
 	impl->scheduler = std::make_unique<threads::ThreadScheduler>(
 		impl->memory, *impl->backend, *impl->thunks, *impl->events, scheduler_config);

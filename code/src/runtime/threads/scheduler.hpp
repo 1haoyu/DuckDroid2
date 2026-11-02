@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -65,6 +66,9 @@ struct SchedulerConfig
 	RandomSource *random = nullptr;
 	// Instance-wide wall/monotonic clock (injectable for replays).
 	RuntimeClock *clock = nullptr;
+	// Called with a guest thread's final TPIDR_EL0 when it exits, so the JNI
+	// layer can release the thread's local references and JNIEnv slot.
+	std::function<void(uint64_t)> thread_exit;
 };
 
 // Owns the guest threads of one RuntimeInstance. One host thread per guest
@@ -105,6 +109,10 @@ class ThreadScheduler final : public ThreadSystem
 	size_t drainDiagnostics(std::vector<observer::DiagnosticEvent> &out);
 	[[nodiscard]] uint64_t droppedDiagnostics() const;
 	[[nodiscard]] size_t liveThreadCount() const;
+
+	// TPIDR_EL0 of the guest main thread. Host-initiated native calls run on
+	// that thread, so their JNI handles belong to this key.
+	[[nodiscard]] uint64_t mainThreadPointer() const;
 
 	// Debug face (M9). Null unless RuntimeInstance::startDebugServer ran.
 	void setDebugServer(debug::DebugServer *server);

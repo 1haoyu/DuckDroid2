@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "common/error/result.hpp"
 #include "common/id/ids.hpp"
@@ -66,6 +67,11 @@ class JniState
 	int64_t invokeEnv(uint32_t slot, HostCallArgs &args);
 	int64_t invokeVm(uint32_t slot, HostCallArgs &args);
 
+	// Thread detach/exit: releases the thread's JNIEnv slot and every local
+	// reference it owns. DebugServers and the scheduler's thread-exit hook call
+	// this with the thread's final TPIDR_EL0.
+	void releaseThread(uint64_t thread_key);
+
 	// Host-facing: calls a native registered through RegisterNatives with
 	// (env, jclass, args...). Must not be called from a guest thread.
 	Result<uint64_t> callRegisteredNative(threads::ThreadScheduler &scheduler,
@@ -114,6 +120,8 @@ class JniState
 	GuestVA vm_table_;
 	GuestVA vm_value_;
 	std::unordered_map<uint64_t, uint64_t> env_slots_;
+	// Cells from detached threads, reused by the next ensureEnvSlot.
+	std::vector<uint64_t> free_env_slots_;
 };
 
 } // namespace duckemu::runtime::jni

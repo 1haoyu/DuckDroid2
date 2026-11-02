@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "common/error/result.hpp"
 #include "common/id/ids.hpp"
@@ -84,6 +85,10 @@ struct RuntimeThread
 	uint32_t parent_tid = 0;
 	// Only recorded; the guest's libc owns the TLS block (M3 decision: adopt).
 	uint64_t tls_tp = 0;
+	// Every TPIDR_EL0 value this thread has run with. bionic rewrites the
+	// pointer through __set_tls (no syscall), so JNI state created under an
+	// older value still has to be released when the thread exits.
+	std::vector<uint64_t> tls_keys;
 	uint64_t clear_child_tid = 0;
 	bool is_main = false;
 	ThreadState state = ThreadState::Created;

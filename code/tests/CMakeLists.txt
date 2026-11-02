@@ -518,6 +518,11 @@ target_include_directories(jni_layout_test SYSTEM PRIVATE "${DUCKEMU_JNI_INCLUDE
 add_test(NAME jni_layout_test COMMAND jni_layout_test)
 duckemu_set_warnings(jni_layout_test)
 
+add_executable(ref_table_test unit/runtime/ref_table_test.cpp)
+target_link_libraries(ref_table_test PRIVATE duckemu_runtime duckemu_test_support)
+add_test(NAME ref_table_test COMMAND ref_table_test)
+duckemu_set_warnings(ref_table_test)
+
 add_executable(04b_libc_map integration/04b_libc_map.cpp)
 target_link_libraries(04b_libc_map PRIVATE duckemu_runtime duckemu_test_support)
 target_compile_definitions(04b_libc_map PRIVATE

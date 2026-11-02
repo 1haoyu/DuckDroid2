@@ -35,6 +35,20 @@ constexpr int kArgRegs[8] = {
 	UC_ARM64_REG_X7,
 };
 
+// Remembers a TPIDR_EL0 value the thread has run with. The guest's libc can
+// rewrite it, and JNI state is keyed by it.
+void noteTlsKey(RuntimeThread &thread, uint64_t key)
+{
+	if (key == 0)
+	{
+		return;
+	}
+	if (std::find(thread.tls_keys.begin(), thread.tls_keys.end(), key) == thread.tls_keys.end())
+	{
+		thread.tls_keys.push_back(key);
+	}
+}
+
 // M3's only blocking syscall. FUTEX_WAIT has already checked *uaddr == val
 // before this object exists, so a wake completes with 0 (the kernel does not
 // re-check after a wake either).
@@ -102,6 +116,7 @@ Result<void> ThreadScheduler::start()
 	}
 	std::unique_ptr<RuntimeThread> thread = std::move(created).value();
 	thread->tls_tp = config_.main_tls_tp.value();
+	noteTlsKey(*thread, thread->tls_tp);
 	thread->state = ThreadState::Idle;
 	main_ = thread.get();
 	{
@@ -530,6 +545,7 @@ void ThreadScheduler::hostThreadLoop(RuntimeThread &thread)
 			if (auto tp = thread.engine->readRegister(UC_ARM64_REG_TPIDR_EL0); tp.ok())
 			{
 				thread.tls_tp = tp.value();
+				noteTlsKey(thread, thread.tls_tp);
 			}
 			debug_->serve(thread);
 		}
@@ -597,6 +613,7 @@ void ThreadScheduler::handleRunOutcome(RuntimeThread &thread, const Result<RunOu
 	if (auto tp = thread.engine->readRegister(UC_ARM64_REG_TPIDR_EL0); tp.ok())
 	{
 		thread.tls_tp = tp.value();
+		noteTlsKey(thread, thread.tls_tp);
 	}
 
 	// A handler may have blocked or exited the thread from inside the hook.
@@ -676,6 +693,24 @@ void ThreadScheduler::finalizeThread(RuntimeThread &thread)
 	// The engine is destroyed by the reaper on another host thread. Closing it
 	// from this (exiting) thread races with the parent opening a new engine
 	// inside its clone hook: both touch Unicorn's opener/TCG state.
+
+	// JNI state belongs to the thread, not the instance: release its local
+	// references and JNIEnv slot now that it can no longer run. The hook writes
+	// guest memory, so it takes the execution lock like CLEARTID below. A
+	// libc-rewritten thread pointer could have left state under an older key,
+	// so every key the thread ran with is released.
+	if (config_.thread_exit)
+	{
+		auto execution = lockExecution();
+		if (thread.tls_keys.empty())
+		{
+			config_.thread_exit(thread.tls_tp);
+		}
+		for (const uint64_t key : thread.tls_keys)
+		{
+			config_.thread_exit(key);
+		}
+	}
 
 	// CLEARTID and the join wake come last: by the time a joiner is woken the
 	// Exited event has been published, so the host observes a stable thread
@@ -794,6 +829,7 @@ int64_t ThreadScheduler::cloneThread(RuntimeThread &parent, const CloneRequest &
 			return svc::kError(svc::kEfault);
 		}
 		child->tls_tp = request.tls.value();
+		noteTlsKey(*child, child->tls_tp);
 	}
 	if (auto written = child->engine->writeRegister(UC_ARM64_REG_X0, 0); !written.ok())
 	{
@@ -1117,6 +1153,16 @@ size_t ThreadScheduler::liveThreadCount() const
 {
 	std::lock_guard<std::mutex> lock(instance_mutex_);
 	return threads_.size();
+}
+
+uint64_t ThreadScheduler::mainThreadPointer() const
+{
+	std::lock_guard<std::mutex> lock(instance_mutex_);
+	if (main_ != nullptr)
+	{
+		return main_->tls_tp;
+	}
+	return config_.main_tls_tp.value();
 }
 
 void ThreadScheduler::setDebugServer(debug::DebugServer *server)
